@@ -9,7 +9,7 @@ price discrepancies, and (when a profitable opportunity appears) executes a
 - **Wallet:** MetaMask (you supply the account's private key via `.env`)
 - **DEXs:** Uniswap V3 + Pancakeswap V3
 - **Flash loans:** Balancer V2 Vault
-- **Deployment target:** developed/tested on a workstation, runs in production on a Raspberry Pi 4
+- **Deployment target:** developed/tested on a workstation, runs in production on a VPS
 
 ## Technology Stack & Tools
 
@@ -41,7 +41,7 @@ The bot is composed of a discovery step plus five core functions in `bot.js`:
   Balancer flash loan, performs both swaps, repays the loan, and sends profit to the owner.
 
 A global lock (`isExecuting`) ensures only one opportunity is worked at a time, which
-keeps nonces sane and is friendly to a low-powered Pi.
+keeps nonces sane and is friendly to a modest VPS.
 
 ### The strategy (`determineProfitability`)
 
@@ -89,9 +89,16 @@ Create `.env` (see `.env.example`):
 ```
 ALCHEMY_API_KEY="your_arbitrum_alchemy_key"
 PRIVATE_KEY="0xyour_metamask_account_private_key"
+
+# Optional — dashboard (see "Stats dashboard")
+PORT="5000"
+DASHBOARD_USER="admin"
+DASHBOARD_PASS="a-long-random-password"
 ```
 The same Alchemy key is used for the WebSocket RPC and for Hardhat forking.
 For local testing, use a throwaway key printed by `npx hardhat node` — **not** your real one.
+`DASHBOARD_USER`/`DASHBOARD_PASS` gate the web dashboard with HTTP basic auth; leave them
+unset for local testing (the bot will warn that the dashboard is unprotected).
 
 **Getting your key from MetaMask:** MetaMask → select the account → Account details →
 Show private key. A headless bot cannot pop the extension, so it signs with this key directly.
@@ -172,7 +179,7 @@ This forks Arbitrum locally so you can test the full trade flow with fake money.
 
 ---
 
-## Walkthrough B — Deploy to production (real Arbitrum + Raspberry Pi)
+## Walkthrough B — Deploy to production (real Arbitrum + VPS)
 
 > Real funds and real gas. Start with `isDeployed: false` (monitor-only) until you
 > trust your strategy, and always use a dedicated MetaMask account.
@@ -193,27 +200,27 @@ In `config.json → PROJECT_SETTINGS`:
 ```
 With `isLocal: false` the bot connects over the Alchemy WebSocket automatically.
 
-### 3. Prepare the Raspberry Pi 4
+### 3. Prepare the VPS
 ```bash
-# Install Node LTS via nvm (ARM build) on the Pi:
+# Install Node LTS via nvm on the VPS:
 curl -fsSL -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
 # restart shell
 nvm install --lts
 
-# Copy the project to the Pi (or git clone), then:
-cd trading_bot_v3-master
+# Clone the project, then:
+git clone <your-repo> && cd trading_bot_v3-master
 npm install
 npx hardhat compile        # needed so bot.js can load the contract ABI
 ```
-Create `.env` on the Pi with your Alchemy key and the dedicated account's private key.
+Create `.env` on the VPS with your Alchemy key, the dedicated account's private key, and
+(recommended) `DASHBOARD_USER`/`DASHBOARD_PASS`.
 
-> The Pi only ever runs `bot.js`. Do **not** try to run `npx hardhat node` (forking) on
-> the Pi — it's too heavy. All forking/deploy/manipulate steps stay on your workstation.
+> The VPS only ever runs `bot.js`. You do **not** run `npx hardhat node` (forking) there —
+> all forking/deploy/manipulate steps stay on your workstation.
 
 ### 4. Run it as a service (survives reboots & crashes)
-The cleanest approach on a Pi is a `systemd` unit. Create
-`/etc/systemd/system/arb-bot.service` (adjust the user and the node path from
-`which node`):
+Use a `systemd` unit. Create `/etc/systemd/system/arb-bot.service` (adjust the user and
+the node path from `which node`):
 ```ini
 [Unit]
 Description=Arbitrum Arbitrage Bot
@@ -222,9 +229,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=pi
-WorkingDirectory=/home/pi/trading_bot_v3-master
-ExecStart=/home/pi/.nvm/versions/node/vXX.XX.X/bin/node bot.js
+User=ubuntu
+WorkingDirectory=/home/ubuntu/trading_bot_v3-master
+ExecStart=/home/ubuntu/.nvm/versions/node/vXX.XX.X/bin/node bot.js
 Restart=always
 RestartSec=10
 Environment=NODE_ENV=production
@@ -243,18 +250,67 @@ journalctl -u arb-bot -f           # follow the logs
 Alternatively, use `pm2` (`npm i -g pm2`; `pm2 start bot.js --name arb-bot`;
 `pm2 save`; `pm2 startup`).
 
-### 5. Going live
+### 5. Secure the dashboard port
+The bot serves a stats dashboard on `PORT` (default 5000), which is internet-facing on a
+VPS. Protect it:
+- Set `DASHBOARD_USER`/`DASHBOARD_PASS` in `.env` (HTTP basic auth), **and/or**
+- Firewall the port so only you can reach it, e.g. `sudo ufw allow from <your-ip> to any port 5000`,
+  or bind it behind a reverse proxy with TLS.
+
+The bot logs a warning on startup if no dashboard auth is configured.
+
+### 6. Going live
 Once you're confident in your `determineProfitability()` strategy and have watched
 the bot in monitor-only mode, set `isDeployed: true` in `config.json` and restart the
 service. Make sure the account holds enough ETH for gas.
 
 ---
 
+## Logging & tax records
+
+Every executed trade is appended to **`logs/trades.jsonl`** (one JSON object per line) —
+this is your auditable tax/accounting record. Every evaluated opportunity (executed,
+rejected, or detected in monitor mode) is appended to **`logs/opportunities.jsonl`** for
+the detection→execution funnel and stats. `logs/` is gitignored (it's private financial data).
+
+Each trade record captures everything you need for taxes:
+
+- UTC timestamp, pair, fee tier, buy/sell DEX
+- base & quote token symbols + **addresses** + decimals
+- prices on both DEXs and the % difference
+- flash-loan size, **gross profit, gas cost, and net profit** (in the base token)
+- **USD-estimated** gross / gas / net (priced via a `<token>→USDC` quote at trade time)
+- ROI %, **transaction hash**, and block number
+
+**Tax export:** download a flat CSV of all trades from the dashboard's *Download tax CSV*
+button, or `GET /export/trades.csv` — ready for a spreadsheet or tax software.
+
+> USD values are best-effort estimates from on-chain pools at execution time. For
+> stablecoin bases they're ~exact; for a WETH base they use the live WETH/USDC price.
+> Confirm figures against the on-chain tx (hash is logged) for filing.
+
+## Stats dashboard
+
+The bot serves a self-contained web dashboard on `PORT` (default **5000**) — open
+`http://<server>:5000` in a browser. It shows KPI tiles (net profit, trades, execution
+rate, gas), the detection→execution funnel, a cumulative-profit chart, net profit per
+pair, and a recent-trades table. It auto-refreshes every 15s. Endpoints:
+
+| Route | Purpose |
+|---|---|
+| `/` | dashboard UI |
+| `/api/stats` | aggregated stats (JSON) |
+| `/api/trades?limit=N` | recent trades (JSON) |
+| `/export/trades.csv` | all trades as CSV (tax export) |
+
+On a VPS this port is internet-facing — see *Walkthrough B → step 5* to protect it with
+basic auth (`DASHBOARD_USER`/`DASHBOARD_PASS`) and/or a firewall.
+
 ## Project layout
 
 ```
-bot.js                     # the bot: discovery, monitoring, and the trade pipeline
-config.json                # tokens, fee tiers, exchange addresses, project settings
+bot.js                     # the bot: discovery, monitoring, trade pipeline, logging
+config.json                # tokens, fee tiers, exchange addresses, project + strategy settings
 hardhat.config.js          # solidity + networks (hardhat fork / localhost / arbitrum)
 contracts/Arbitrage.sol    # Balancer flash-loan arbitrage contract
 scripts/deploy.js          # deploy the Arbitrage contract
@@ -263,7 +319,10 @@ scripts/discover-test.js   # read-only discovery check against a public RPC
 helpers/helpers.js         # discoverPairs, price calc, pool/token helpers
 helpers/initialization.js  # provider + DEX/contract setup
 helpers/abi.js             # pool ABIs (incl. Pancakeswap's custom Swap event)
-helpers/server.js          # tiny express server
+helpers/logger.js          # append-only trade/opportunity logging, stats, CSV export
+helpers/server.js          # express server: dashboard + JSON/CSV API (optional auth)
+helpers/public/index.html  # the stats dashboard (single self-contained page)
+logs/                      # trades.jsonl + opportunities.jsonl (gitignored)
 ```
 
 ## Customizing for other pairs / chains
