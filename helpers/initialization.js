@@ -36,8 +36,12 @@ const pancakeswap = {
   router: new ethers.Contract(config.PANCAKESWAP.ROUTER_V3, ISwapRouter.abi, provider)
 }
 
-const IArbitrage = require('../artifacts/contracts/Arbitrage.sol/Arbitrage.json')
-
+// -- ARBITRAGE CONTRACT (EXECUTION MODE ONLY) -- //
+// The deployed Arbitrage contract is only needed when the bot is going to send
+// trades (isDeployed === true). In monitor mode we skip this entirely: no ABI
+// artifact is loaded (so no `npx hardhat compile` step is required), no address
+// is validated, and `arbitrage` stays null. Nothing downstream may reference
+// `arbitrage` unless execution mode is enabled.
 let arbitrage = null
 
 if (
@@ -45,6 +49,8 @@ if (
   config.PROJECT_SETTINGS.ARBITRAGE_ADDRESS &&
   ethers.isAddress(config.PROJECT_SETTINGS.ARBITRAGE_ADDRESS)
 ) {
+  // Required lazily so monitor mode never depends on the compiled artifact.
+  const IArbitrage = require('../artifacts/contracts/Arbitrage.sol/Arbitrage.json')
   arbitrage = new ethers.Contract(
     config.PROJECT_SETTINGS.ARBITRAGE_ADDRESS,
     IArbitrage.abi,

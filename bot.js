@@ -13,6 +13,29 @@ const {
 const { provider, uniswap, pancakeswap, arbitrage } = require('./helpers/initialization')
 const logger = require('./helpers/logger')
 
+// -- MODE -----------------------------------------------------------------
+// The bot runs in one of two fully independent modes, selected in config.json:
+//
+//   MONITOR MODE   (isDeployed = false)
+//     Connect to the chain, discover pools, subscribe to Swap events, compute
+//     spreads, size trades and estimate gross profitability, then LOG the
+//     opportunity and update the dashboard. It never creates a signer, never
+//     touches a deployed contract, never estimates gas and never sends a tx.
+//     Zero on-chain footprint and zero risk — no ARBITRAGE_ADDRESS required.
+//
+//   EXECUTION MODE (isDeployed = true)
+//     Everything monitor mode does, PLUS: create a signer, estimate gas against
+//     the real flash loan, require the profit to beat gas, execute the trade,
+//     and log the tx hash + realized profit.
+//
+// Every execution-only concern (signer, gas estimation, executeTrade) is gated
+// on this single flag, so monitor mode can run without a contract or key.
+const IS_EXECUTION_MODE = config.PROJECT_SETTINGS.isDeployed === true
+
+// The signer is only needed to estimate/send transactions, so it exists in
+// execution mode only. It is created once, up front, in assertExecutionReady().
+let account = null
+
 // -- CONFIGURATION VALUES HERE -- //
 const UNITS = config.PROJECT_SETTINGS.PRICE_UNITS
 const PRICE_DIFFERENCE = config.PROJECT_SETTINGS.PRICE_DIFFERENCE
@@ -101,7 +124,39 @@ const buildExecutedRecord = async (_pair, priceInfo, metrics, exec) => {
 // collisions and overlapping trades when many pools fire events at once).
 let isExecuting = false
 
+/**
+ * EXECUTION MODE precondition check. Fails fast (before any pools are watched)
+ * with an actionable message if the config asks us to trade but isn't set up to,
+ * and creates the shared signer. Never called in monitor mode.
+ */
+const assertExecutionReady = () => {
+  if (!arbitrage) {
+    throw new Error(
+      "Execution mode (isDeployed=true) requires a deployed Arbitrage contract, but none was " +
+      "initialized. Set a valid ARBITRAGE_ADDRESS in config.json (and deploy the contract), " +
+      "or set isDeployed=false to run in monitor-only mode."
+    )
+  }
+  if (!process.env.PRIVATE_KEY) {
+    throw new Error("Execution mode requires PRIVATE_KEY in .env to sign transactions.")
+  }
+  account = new ethers.Wallet(process.env.PRIVATE_KEY, provider)
+}
+
 const main = async () => {
+  // -- STARTUP: announce mode & network, and validate execution prerequisites --
+  const network = config.PROJECT_SETTINGS.isLocal ? 'local Hardhat fork' : 'Arbitrum One'
+  if (IS_EXECUTION_MODE) {
+    assertExecutionReady()
+    console.log(`Mode: EXECUTION — profitable opportunities WILL be traded.`)
+    console.log(`  Contract: ${config.PROJECT_SETTINGS.ARBITRAGE_ADDRESS}`)
+    console.log(`  Signer:   ${account.address}`)
+  } else {
+    console.log(`Mode: MONITOR — opportunities are detected & logged only; no trades are sent.`)
+    console.log(`  (set isDeployed=true in config.json to enable execution)`)
+  }
+  console.log(`Network: ${network}\n`)
+
   console.log(`Discovering pairs available on BOTH Uniswap V3 & Pancakeswap V3...\n`)
 
   const discovered = await discoverPairs(uniswap, pancakeswap, config, provider)
@@ -162,7 +217,7 @@ const eventHandler = async (_pair) => {
       return
     }
 
-    if (!config.PROJECT_SETTINGS.isDeployed) {
+    if (!IS_EXECUTION_MODE) {
       // Monitor-only mode: record the detected opportunity but don't trade
       logger.recordOutcome(buildRecord('detected', _pair, priceInfo, metrics, {}))
       console.log(`Profitable opportunity detected on ${_pair.label} (monitor mode; set isDeployed=true to trade)\n`)
@@ -328,6 +383,64 @@ const valueInUsdc = async (amountRaw, token) => {
   return null
 }
 
+// The contract's executeTrade takes the two router addresses and the two-token
+// path. Both determineProfitability (gas estimate) and executeTrade need these,
+// so build them in one place. exchangePath[0] is the buy DEX, [1] is the sell DEX.
+const buildTradePaths = async (_exchangePath, _pair) => ({
+  routerPath: [
+    await _exchangePath[0].router.getAddress(),
+    await _exchangePath[1].router.getAddress()
+  ],
+  tokenPath: [_pair.token0.address, _pair.token1.address]
+})
+
+/**
+ * EXECUTION MODE ONLY. Simulate the real executeTrade flash loan via estimateGas
+ * — which runs the whole loan and reverts if it wouldn't repay — and return the
+ * gas cost in wei. Requires the deployed contract (`arbitrage`) and `account`,
+ * so it is only ever called from the execution-mode branch below.
+ */
+const estimateTradeGas = async (_exchangePath, _pair, _flashAmount) => {
+  const { routerPath, tokenPath } = await buildTradePaths(_exchangePath, _pair)
+  try {
+    const gasUnits = await arbitrage
+      .connect(account)
+      .executeTrade
+      .estimateGas(routerPath, tokenPath, _pair.fee, _flashAmount)
+    const feeData = await provider.getFeeData()
+    const gasPrice = feeData.gasPrice ?? feeData.maxFeePerGas ?? 0n
+    return gasUnits * gasPrice
+  } catch (err) {
+    throw new Error(`Trade would revert on-chain: ${err.shortMessage || err.reason || err.message}`)
+  }
+}
+
+// Pretty-print the evaluated opportunity. Gas / net-profit rows only appear in
+// execution mode (monitor mode never estimates gas), so they're printed
+// conditionally on whether gas metrics were populated.
+const printProfitabilityTable = (_pair, buy, sell, m, token0) => {
+  const data = {
+    'Pair': _pair.label,
+    'Buy on': buy.name,
+    'Sell on': sell.name,
+    'Flash amount': `${fmt(m.flashAmount, token0)} ${token0.symbol}`,
+    'Gross profit': `${fmt(m.grossProfit, token0)} ${token0.symbol}`,
+    'ROI': `${m.roiPct.toFixed(4)}%`
+  }
+  if (m.gasCostWei !== undefined) {
+    data['Est. gas'] = m.gasCostBase === null
+      ? `${ethers.formatUnits(m.gasCostWei, 18)} ETH (no WETH/${token0.symbol} pool to price it)`
+      : `${fmt(m.gasCostBase, token0)} ${token0.symbol}`
+    if (m.netProfit !== null && m.netProfit !== undefined) {
+      data['Net profit (after gas)'] = `${fmt(m.netProfit, token0)} ${token0.symbol}`
+    }
+  } else {
+    data['Est. gas'] = 'n/a (monitor mode — set isDeployed=true to price gas & trade)'
+  }
+  console.table(data)
+  console.log()
+}
+
 /**
  * Decide whether this opportunity is worth trading, and at what size.
  *
@@ -429,57 +542,42 @@ const determineProfitability = async (_exchangePath, _pair) => {
       throw new Error(`Profit ${fmt(grossProfit, token0)} ${token0.symbol} below ${MIN_PROFIT_BPS} bps minimum (${fmt(minProfit, token0)})`)
     }
 
-    // --- 5. Confirm the trade actually executes on-chain and price the gas ---
-    // estimateGas runs the real flash loan; it reverts if the loan can't be repaid.
-    const routerPath = [await buy.router.getAddress(), await sell.router.getAddress()]
-    const tokenPath = [token0.address, token1.address]
-    const account = new ethers.Wallet(process.env.PRIVATE_KEY, provider)
-
-    let gasCostWei
-    try {
-      const gasUnits = await arbitrage.connect(account).executeTrade.estimateGas(routerPath, tokenPath, fee, flashAmount)
-      const feeData = await provider.getFeeData()
-      const gasPrice = feeData.gasPrice ?? feeData.maxFeePerGas ?? 0n
-      gasCostWei = gasUnits * gasPrice
-    } catch (err) {
-      throw new Error(`Trade would revert on-chain: ${err.shortMessage || err.reason || err.message}`)
-    }
-
-    // Convert gas into token0 so we can check net profit for ANY base (WETH or stable)
-    const gasCostBase = await gasCostInToken0(gasCostWei, token0)
-    const netProfit = gasCostBase === null ? null : grossProfit - gasCostBase
+    // ROI (gross profit as a % of the flash amount) — reported in both modes
     const roiPct = Number((grossProfit * 1000000n) / flashAmount) / 10000
-    m.gasCostWei = gasCostWei
-    m.gasCostBase = gasCostBase
-    m.netProfit = netProfit
     m.roiPct = roiPct
 
-    const data = {
-      'Pair': _pair.label,
-      'Buy on': buy.name,
-      'Sell on': sell.name,
-      'Flash amount': `${fmt(flashAmount, token0)} ${token0.symbol}`,
-      'Gross profit': `${fmt(grossProfit, token0)} ${token0.symbol}`,
-      'ROI': `${roiPct.toFixed(4)}%`,
-      'Est. gas': gasCostBase === null
-        ? `${ethers.formatUnits(gasCostWei, 18)} ETH (no WETH/${token0.symbol} pool to price it)`
-        : `${fmt(gasCostBase, token0)} ${token0.symbol}`
-    }
-    if (netProfit !== null) {
-      data['Net profit (after gas)'] = `${fmt(netProfit, token0)} ${token0.symbol}`
-    }
-    console.table(data)
-    console.log()
+    // --- 5. EXECUTION-ONLY gates: real gas + net-of-gas profitability ---------
+    // MONITOR MODE stops after the gross-profit / bps gate above: there is no
+    // deployed contract to estimate gas against and we never send a tx, so we
+    // report gross-only metrics. EXECUTION MODE additionally simulates the real
+    // flash loan (estimateGas reverts if the loan can't be repaid), prices the
+    // gas in token0, and requires the profit to beat gas.
+    if (IS_EXECUTION_MODE) {
+      const gasCostWei = await estimateTradeGas(_exchangePath, _pair, flashAmount)
 
-    // Require net > 0 whenever we could price gas; otherwise fall back to the bps gate
-    if (netProfit !== null && netProfit <= 0n) {
-      throw new Error("Gross profit does not cover gas")
+      // Convert gas into token0 so we can check net profit for ANY base (WETH or stable)
+      const gasCostBase = await gasCostInToken0(gasCostWei, token0)
+      const netProfit = gasCostBase === null ? null : grossProfit - gasCostBase
+      m.gasCostWei = gasCostWei
+      m.gasCostBase = gasCostBase
+      m.netProfit = netProfit
+
+      printProfitabilityTable(_pair, buy, sell, m, token0)
+
+      // Require net > 0 whenever we could price gas; otherwise fall back to the bps gate
+      if (netProfit !== null && netProfit <= 0n) {
+        throw new Error("Gross profit does not cover gas")
+      }
+
+      // USD values for the tax log (best-effort; null if no pool to price them)
+      m.gasCostUsd = await valueInUsdc(gasCostBase, token0)
+      m.netProfitUsd = await valueInUsdc(netProfit, token0)
+    } else {
+      printProfitabilityTable(_pair, buy, sell, m, token0)
     }
 
-    // USD values for the tax log (best-effort; null if no pool to price them)
+    // Gross-profit USD value is logged in both modes (best-effort)
     m.grossProfitUsd = await valueInUsdc(grossProfit, token0)
-    m.gasCostUsd = await valueInUsdc(gasCostBase, token0)
-    m.netProfitUsd = await valueInUsdc(netProfit, token0)
 
     return { isProfitable: true, amount: flashAmount, metrics: m }
 
@@ -491,45 +589,30 @@ const determineProfitability = async (_exchangePath, _pair) => {
   }
 }
 
+// EXECUTION MODE ONLY. Fire the flash-loan arbitrage through the deployed
+// Arbitrage contract, then report the realized on-chain values for the trade
+// log. Only ever called from the execution-mode branch in eventHandler, so it
+// can assume `arbitrage` and `account` exist.
 const executeTrade = async (_exchangePath, _pair, _amount) => {
   console.log(`Attempting Arbitrage...\n`)
 
   const _token0 = _pair.token0
-  const _token1 = _pair.token1
-  const fee = _pair.fee
-
-  const routerPath = [
-    await _exchangePath[0].router.getAddress(),
-    await _exchangePath[1].router.getAddress()
-  ]
-
-  const tokenPath = [
-    _token0.address,
-    _token1.address
-  ]
-
-  // Create Signer
-  const account = new ethers.Wallet(process.env.PRIVATE_KEY, provider)
+  const { routerPath, tokenPath } = await buildTradePaths(_exchangePath, _pair)
 
   // Fetch token balances before
   const tokenBalanceBefore = await _token0.contract.balanceOf(account.address)
   const ethBalanceBefore = await provider.getBalance(account.address)
 
-  let txHash = null
-  let blockNumber = null
+  const transaction = await arbitrage.connect(account).executeTrade(
+    routerPath,
+    tokenPath,
+    _pair.fee,
+    _amount
+  )
 
-  if (config.PROJECT_SETTINGS.isDeployed) {
-    const transaction = await arbitrage.connect(account).executeTrade(
-      routerPath,
-      tokenPath,
-      fee,
-      _amount
-    )
-
-    txHash = transaction.hash
-    const receipt = await transaction.wait(0)
-    blockNumber = receipt?.blockNumber ?? null
-  }
+  const txHash = transaction.hash
+  const receipt = await transaction.wait(0)
+  const blockNumber = receipt?.blockNumber ?? null
 
   console.log(`Trade Complete:\n`)
 
@@ -571,4 +654,9 @@ const executeTrade = async (_exchangePath, _pair, _amount) => {
   }
 }
 
-main()
+main().catch((error) => {
+  // Startup failures (e.g. execution mode without a deployed contract / key)
+  // should stop the bot with a clear message rather than a stack-trace dump.
+  console.error(`\nFatal: ${error.message || error}\n`)
+  process.exit(1)
+})
