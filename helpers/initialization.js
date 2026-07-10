@@ -37,7 +37,20 @@ const pancakeswap = {
 }
 
 const IArbitrage = require('../artifacts/contracts/Arbitrage.sol/Arbitrage.json')
-const arbitrage = new ethers.Contract(config.PROJECT_SETTINGS.ARBITRAGE_ADDRESS, IArbitrage.abi, provider)
+
+let arbitrage = null
+
+if (
+  config.PROJECT_SETTINGS.isDeployed &&
+  config.PROJECT_SETTINGS.ARBITRAGE_ADDRESS &&
+  ethers.isAddress(config.PROJECT_SETTINGS.ARBITRAGE_ADDRESS)
+) {
+  arbitrage = new ethers.Contract(
+    config.PROJECT_SETTINGS.ARBITRAGE_ADDRESS,
+    IArbitrage.abi,
+    provider
+  )
+}
 
 module.exports = {
   provider,
