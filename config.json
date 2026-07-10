@@ -1,0 +1,57 @@
+{
+    "PROJECT_SETTINGS": {
+        "isLocal": true,
+        "isDeployed": true,
+        "ARBITRAGE_ADDRESS": "0x21dd08c28e8699dc613ACaF6978eD688Cc17aabF",
+        "PRICE_UNITS": 0,
+        "PRICE_DIFFERENCE": 0.5,
+        "GAS_LIMIT": 600000,
+        "GAS_PRICE": 0.00000001,
+        "DISCOVERY_CONCURRENCY": 8
+    },
+    "STRATEGY": {
+        "MIN_PROFIT_BPS": 10,
+        "MAX_POOL_FRACTION": 0.05,
+        "SEARCH_STEPS": 20,
+        "REFINE_ITERS": 12
+    },
+    "TOKENS": {
+        "BASE": {
+            "WETH": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+            "USDC": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+            "USDT": "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9"
+        },
+        "QUOTE": {
+            "WETH": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+            "USDC": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+            "USDT": "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9",
+            "USDCe": "0xff970a61a04b1ca14834a43f5de4533ebddb5cc8",
+            "DAI": "0xda10009cbd5d07dd0cecc66161fc93d7c9000da1",
+            "WBTC": "0x2f2a2543b76a4166549f7aab2e75bef0aefc5b0f",
+            "ARB": "0x912ce59144191c1204e64559fe8253a0e49e6548",
+            "LINK": "0xf97f4df75117a78c1a5a0dbb814af92458539fb4",
+            "UNI": "0xfa7f8980b0f1e64a2062791cc3b0871572f1f7f0",
+            "GMX": "0xfc5a1a6eb076a2c7ad06ed22c90d7e710e35ad0a",
+            "PENDLE": "0x0c880f6761f1af8d9aa9c466984b80dab9a8c9e8"
+        },
+        "FEE_TIERS": [100, 500, 2500, 3000, 10000]
+    },
+    "MANIPULATE": {
+        "EXCHANGE": "pancakeswap",
+        "TOKEN_IN": "0x912ce59144191c1204e64559fe8253a0e49e6548",
+        "TOKEN_OUT": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+        "POOL_FEE": 500,
+        "AMOUNT": "10000",
+        "UNLOCKED_ACCOUNT": "0xB38e8c17e38363aF6EbdCb3dAE12e0243582891D"
+    },
+    "UNISWAP": {
+        "QUOTER_V3": "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
+        "FACTORY_V3": "0x1F98431c8aD98523631AE4a59f267346ea31F984",
+        "ROUTER_V3": "0xE592427A0AEce92De3Edee1F18E0157C05861564"
+    },
+    "PANCAKESWAP": {
+        "QUOTER_V3": "0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997",
+        "FACTORY_V3": "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865",
+        "ROUTER_V3": "0x1b81D678ffb9C0263b24A97847620C99d213eB14"
+    }
+}

@@ -1,0 +1,207 @@
+const ethers = require("ethers")
+const Big = require('big.js')
+
+// Enough precision for division across large decimal gaps (e.g. 6-decimal stables
+// paired with 18-decimal tokens) without underflowing to zero.
+Big.DP = 40
+
+/**
+ * This file could be used for adding functions you
+ * may need to call multiple times or as a way to
+ * abstract logic from bot.js. Feel free to add
+ * in your own functions you desire here!
+ */
+
+const { IUniswapV3Pool, IPancakeswapV3Pool } = require('./abi')
+const IERC20 = require('@openzeppelin/contracts/build/contracts/ERC20.json')
+
+const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
+
+// Cache token metadata so we only hit the chain once per token during discovery
+const _tokenCache = new Map()
+
+async function getTokenData(_address, _provider) {
+  const address = ethers.getAddress(_address)
+
+  if (_tokenCache.has(address)) {
+    return _tokenCache.get(address)
+  }
+
+  const contract = new ethers.Contract(address, IERC20.abi, _provider)
+
+  const [symbol, decimals] = await Promise.all([
+    contract.symbol(),
+    contract.decimals()
+  ])
+
+  const token = {
+    contract,
+    address,
+    symbol,
+    decimals: Number(decimals), // ethers v6 returns a BigInt; Big.js needs a Number
+  }
+
+  _tokenCache.set(address, token)
+  return token
+}
+
+async function getTokenAndContract(_token0Address, _token1Address, _provider) {
+  const token0 = await getTokenData(_token0Address, _provider)
+  const token1 = await getTokenData(_token1Address, _provider)
+
+  return { token0, token1 }
+}
+
+// Run an async mapper over items with a bounded number of concurrent workers
+async function mapLimit(_items, _limit, _fn) {
+  const results = new Array(_items.length)
+  let cursor = 0
+
+  const workerCount = Math.max(1, Math.min(_limit, _items.length))
+  const workers = new Array(workerCount).fill(0).map(async () => {
+    while (cursor < _items.length) {
+      const index = cursor++
+      results[index] = await _fn(_items[index], index)
+    }
+  })
+
+  await Promise.all(workers)
+  return results
+}
+
+/**
+ * Auto-discover every base/quote pair (across the configured fee tiers) that has
+ * a live pool on BOTH Uniswap V3 and Pancakeswap V3. Only pairs present on both
+ * exchanges are usable for cross-DEX arbitrage. token0 is always a base token
+ * (the one we flash-loan and take profit in).
+ */
+async function discoverPairs(_uniswap, _pancakeswap, _config, _provider) {
+  const base = _config.TOKENS.BASE
+  const quote = _config.TOKENS.QUOTE
+  const feeTiers = _config.TOKENS.FEE_TIERS
+  const limit = _config.PROJECT_SETTINGS.DISCOVERY_CONCURRENCY || 8
+
+  // Build the unique set of combos to probe. token0 = base, token1 = any other token.
+  const seen = new Set()
+  const combos = []
+
+  for (const baseAddrRaw of Object.values(base)) {
+    const baseAddr = ethers.getAddress(baseAddrRaw)
+
+    for (const quoteAddrRaw of Object.values(quote)) {
+      const quoteAddr = ethers.getAddress(quoteAddrRaw)
+      if (baseAddr === quoteAddr) continue
+
+      for (const fee of feeTiers) {
+        const key = [baseAddr, quoteAddr].sort().join('-') + '-' + fee
+        if (seen.has(key)) continue
+        seen.add(key)
+        combos.push({ baseAddr, quoteAddr, fee })
+      }
+    }
+  }
+
+  // Probe both factories; keep only pairs with a pool on BOTH exchanges.
+  const probed = await mapLimit(combos, limit, async (combo) => {
+    try {
+      const [uPoolAddress, pPoolAddress] = await Promise.all([
+        _uniswap.factory.getPool(combo.baseAddr, combo.quoteAddr, combo.fee),
+        _pancakeswap.factory.getPool(combo.baseAddr, combo.quoteAddr, combo.fee)
+      ])
+
+      if (uPoolAddress === ZERO_ADDRESS || pPoolAddress === ZERO_ADDRESS) {
+        return null
+      }
+
+      const token0 = await getTokenData(combo.baseAddr, _provider)
+      const token1 = await getTokenData(combo.quoteAddr, _provider)
+
+      return {
+        token0,
+        token1,
+        fee: combo.fee,
+        uPoolAddress,
+        pPoolAddress,
+        label: `${token1.symbol}/${token0.symbol} @ ${combo.fee}`
+      }
+    } catch (error) {
+      // Bad address / unresponsive token / non-standard pool — just skip it
+      return null
+    }
+  })
+
+  return probed.filter(Boolean)
+}
+
+// Build a pool contract from an address we already resolved (skips a getPool call)
+function getPoolContractByAddress(_exchange, _poolAddress, _provider) {
+  const poolABI = _exchange.name === "Uniswap V3" ? IUniswapV3Pool : IPancakeswapV3Pool
+  return new ethers.Contract(_poolAddress, poolABI, _provider)
+}
+
+async function getPoolAddress(_factory, _token0, _token1, _fee) {
+  const poolAddress = await _factory.getPool(_token0, _token1, _fee)
+  return poolAddress
+}
+
+async function getPoolContract(_exchange, _token0, _token1, _fee, _provider) {
+  const poolAddress = await getPoolAddress(_exchange.factory, _token0, _token1, _fee)
+  const poolABI = _exchange.name === "Uniswap V3" ? IUniswapV3Pool : IPancakeswapV3Pool
+  const pool = new ethers.Contract(poolAddress, poolABI, _provider)
+  return pool
+}
+
+async function getPoolLiquidity(_factory, _token0, _token1, _fee, _provider) {
+  const poolAddress = await getPoolAddress(_factory, _token0.address, _token1.address, _fee)
+
+  const token0Balance = await _token0.contract.balanceOf(poolAddress)
+  const token1Balance = await _token1.contract.balanceOf(poolAddress)
+
+  return [token0Balance, token1Balance]
+}
+
+async function calculatePrice(_pool, _token0, _token1) {
+  // Understanding Uniswap V3 prices
+  // --> https://blog.uniswap.org/uniswap-v3-math-primer
+
+  // Get sqrtPriceX96...
+  const [sqrtPriceX96] = await _pool.slot0()
+
+  // sqrtPriceX96 encodes poolToken1_raw / poolToken0_raw, where the pool orders its
+  // tokens by address (token0 = lower address). Compute the raw rate, then re-orient
+  // and decimal-adjust so we always return: how many token1 per 1 token0 (caller's
+  // orientation), in human units. Consistent orientation keeps the buy/sell direction
+  // correct for every pair, regardless of decimals or address ordering.
+  const sqrt = Big(sqrtPriceX96.toString()).div(Big(2).pow(96))
+  const poolRawPrice = sqrt.times(sqrt) // poolToken1_raw / poolToken0_raw
+
+  const token0IsPoolToken0 = _token0.address.toLowerCase() < _token1.address.toLowerCase()
+
+  // Raw price of caller.token1 per caller.token0
+  const callerRawPrice = token0IsPoolToken0 ? poolRawPrice : Big(1).div(poolRawPrice)
+
+  // Scale from raw to human units
+  const decimalDiff = _token0.decimals - _token1.decimals
+  const price = decimalDiff >= 0
+    ? callerRawPrice.times(Big(10).pow(decimalDiff))
+    : callerRawPrice.div(Big(10).pow(-decimalDiff))
+
+  return price.toString()
+}
+
+async function calculateDifference(_uPrice, _sPrice) {
+  return (((_uPrice - _sPrice) / _sPrice) * 100).toFixed(2)
+}
+
+module.exports = {
+  getTokenData,
+  getTokenAndContract,
+  getPoolAddress,
+  getPoolContract,
+  getPoolContractByAddress,
+  getPoolLiquidity,
+  calculatePrice,
+  calculateDifference,
+  discoverPairs,
+  mapLimit,
+}
