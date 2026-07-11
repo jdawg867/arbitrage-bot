@@ -14,7 +14,7 @@ Big.DP = 40
 
 const { IUniswapV3Pool, IPancakeswapV3Pool } = require('./abi')
 const IERC20 = require('@openzeppelin/contracts/build/contracts/ERC20.json')
-const { withRetry } = require('./rpc')
+const { withRetry, isEmptyData } = require('./rpc')
 
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 
@@ -130,6 +130,33 @@ async function discoverPairs(_uniswap, _pancakeswap, _config, _provider) {
     { id: 'uni', name: _uniswap.name, factory: _uniswap.factory },
     { id: 'pancake', name: _pancakeswap.name, factory: _pancakeswap.factory }
   ]
+  // Preflight: confirm the RPC can actually answer eth_call. A rate-limited or
+  // mis-provisioned Alchemy key still answers eth_blockNumber but returns empty
+  // data ("missing revert data") for every eth_call — which would make ALL the
+  // getPool probes below fail and flood the log. One canary call fails fast with
+  // an actionable message instead. (A non-existent pool returns the zero address,
+  // which decodes fine; only a broken RPC yields empty data.)
+  if (tokenPairs.length) {
+    const c = tokenPairs[0]
+    try {
+      await withRetry(
+        () => _uniswap.factory.getPool(c.baseAddr, c.quoteAddr, feeTiers[0]),
+        'preflight getPool',
+        { retryEmptyData: true }
+      )
+    } catch (err) {
+      if (isEmptyData(err)) {
+        throw new Error(
+          'RPC preflight failed: the node returns empty data for eth_call while ' +
+          'basic calls work. Your ALCHEMY_API_KEY is almost certainly rate-limited / ' +
+          'over its compute-unit quota, or the Alchemy app is not enabled for ' +
+          'Arbitrum One. Fix the key/app (or use a fresh one) and restart — discovery aborted.'
+        )
+      }
+      throw err
+    }
+  }
+
   const probes = []
   for (const tp of tokenPairs) {
     for (const ex of exchanges) {
