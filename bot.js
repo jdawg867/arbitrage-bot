@@ -13,6 +13,20 @@ const {
 const { provider, uniswap, pancakeswap, arbitrage } = require('./helpers/initialization')
 const logger = require('./helpers/logger')
 const metrics = require('./helpers/metrics')
+const { withRetry } = require('./helpers/rpc')
+
+// -- SAFETY NET --
+// A 24/7 monitor must never die on a stray async error. Per-event errors are
+// already caught in eventHandler; these guards catch anything that slips past
+// (e.g. a rejection from a detached provider callback) and keep the process up.
+process.on('unhandledRejection', (reason) => {
+  const msg = reason && reason.message ? reason.message : String(reason)
+  console.error(`Unhandled rejection (ignored, monitor continues): ${msg}`)
+})
+process.on('uncaughtException', (err) => {
+  const msg = err && err.message ? err.message : String(err)
+  console.error(`Uncaught exception (ignored, monitor continues): ${msg}`)
+})
 
 // -- MODE -----------------------------------------------------------------
 // The bot runs in one of two fully independent modes, selected in config.json:
@@ -318,8 +332,8 @@ const checkPrice = async (_pair) => {
   // Cached from the 'block' subscription — no getBlockNumber() RPC per swap
   const currentBlock = latestBlock
 
-  const uPrice = await calculatePrice(_pair.uPool, _pair.token0, _pair.token1)
-  const pPrice = await calculatePrice(_pair.pPool, _pair.token0, _pair.token1)
+  const uPrice = await withRetry(() => calculatePrice(_pair.uPool, _pair.token0, _pair.token1), `price ${_pair.label} (uni)`)
+  const pPrice = await withRetry(() => calculatePrice(_pair.pPool, _pair.token0, _pair.token1), `price ${_pair.label} (pancake)`)
 
   // Compute the % difference from the RAW prices (rounding to PRICE_UNITS first would
   // collapse sub-1 prices to 0 and yield NaN for stablecoin-decimal pairs).
@@ -475,11 +489,13 @@ const buildTradePaths = (_exchangePath, _pair) => ({
 const estimateTradeGas = async (_exchangePath, _pair, _flashAmount) => {
   const { routerPath, tokenPath } = await buildTradePaths(_exchangePath, _pair)
   try {
-    const gasUnits = await arbitrage
-      .connect(account)
-      .executeTrade
-      .estimateGas(routerPath, tokenPath, _pair.fee, _flashAmount)
-    const feeData = await provider.getFeeData()
+    // A genuine revert (loan can't repay) is permanent and rethrown at once;
+    // only 429/socket blips are retried.
+    const gasUnits = await withRetry(
+      () => arbitrage.connect(account).executeTrade.estimateGas(routerPath, tokenPath, _pair.fee, _flashAmount),
+      `estimateGas ${_pair.label}`
+    )
+    const feeData = await withRetry(() => provider.getFeeData(), 'getFeeData')
     const gasPrice = feeData.gasPrice ?? feeData.maxFeePerGas ?? 0n
     return gasUnits * gasPrice
   } catch (err) {
@@ -539,7 +555,10 @@ const determineProfitability = async (_exchangePath, _pair) => {
     // Use the pool address resolved at discovery time (buy is one of the two
     // exchange objects); avoids a redundant factory.getPool() RPC per evaluation.
     const buyPool = buy.name === uniswap.name ? _pair.uPool : _pair.pPool
-    const [buyToken0Reserve] = await getPoolTokenBalances(buyPool.target, token0, token1)
+    const [buyToken0Reserve] = await withRetry(
+      () => getPoolTokenBalances(buyPool.target, token0, token1),
+      `reserves ${_pair.label}`
+    )
 
     if (buyToken0Reserve === 0n) {
       throw new Error("Buy pool has no token0 liquidity")
@@ -553,12 +572,14 @@ const determineProfitability = async (_exchangePath, _pair) => {
     const roundTripProfit = async (flashAmount) => {
       if (flashAmount <= 0n) return null
       try {
-        const [token1Out] = await buy.quoter.quoteExactInputSingle.staticCall({
+        // Retry transient 429/socket blips per quote; a real "unquotable size"
+        // revert is permanent and falls through to the null return below.
+        const [token1Out] = await withRetry(() => buy.quoter.quoteExactInputSingle.staticCall({
           tokenIn: token0.address, tokenOut: token1.address, amountIn: flashAmount, fee, sqrtPriceLimitX96: 0
-        })
-        const [token0Back] = await sell.quoter.quoteExactInputSingle.staticCall({
+        }), `quote-buy ${_pair.label}`)
+        const [token0Back] = await withRetry(() => sell.quoter.quoteExactInputSingle.staticCall({
           tokenIn: token1.address, tokenOut: token0.address, amountIn: token1Out, fee, sqrtPriceLimitX96: 0
-        })
+        }), `quote-sell ${_pair.label}`)
         return token0Back - flashAmount
       } catch (err) {
         // Size not quotable (e.g. exceeds available liquidity) — unusable
