@@ -72,6 +72,10 @@ const EVAL_ONCE_PER_BLOCK = config.PROJECT_SETTINGS.EVAL_ONCE_PER_BLOCK !== fals
 
 // -- STRATEGY SETTINGS (config.json -> STRATEGY) -- //
 const MIN_PROFIT_BPS = config.STRATEGY.MIN_PROFIT_BPS       // min net profit as basis points of the flash amount
+// Absolute net-USD floor (after gas). The objective is realized net USD, so a
+// trade must clear this dollar amount to execute — filters out gas-dominated
+// marginal trades regardless of ROI%. 0 = disabled. (execution mode only)
+const MIN_NET_PROFIT_USD = config.STRATEGY.MIN_NET_PROFIT_USD ?? 0
 const MAX_POOL_FRACTION = config.STRATEGY.MAX_POOL_FRACTION // never route more than this fraction of the buy pool
 const SEARCH_STEPS = config.STRATEGY.SEARCH_STEPS           // resolution of the coarse size grid
 const REFINE_ITERS = config.STRATEGY.REFINE_ITERS           // ternary-refinement iterations around the best grid point
@@ -530,6 +534,29 @@ const eventHandler = async (_pair) => {
       }
       m.gasCostUsd = await valueInUsdc(gasCostBase, token0)
       m.netProfitUsd = await valueInUsdc(netProfit, token0)
+
+      // Net-USD floor: the objective is realized net USD, so refuse any trade
+      // whose estimated net-of-gas profit is below MIN_NET_PROFIT_USD. This stops
+      // bleeding gas on sub-cent / marginal trades (the ~$0.004 winners and the
+      // drift-into-loss ones). If we can't price net in USD, we can't confirm it
+      // clears the floor — reject (safety over an uncertain trade).
+      if (MIN_NET_PROFIT_USD > 0) {
+        if (m.netProfitUsd === null) {
+          metrics.incr('tradesRejected')
+          const reason = `Cannot price net profit in USD — can't confirm the $${MIN_NET_PROFIT_USD} floor; refusing to trade`
+          logger.recordOutcome(buildRecord('rejected', _pair, priceInfo, m, { reason }))
+          logRejection(_pair, { metrics: m, reason })
+          return
+        }
+        const minNetUsdRaw = BigInt(Math.round(MIN_NET_PROFIT_USD * 1e6)) // USDC 6-dec
+        if (m.netProfitUsd < minNetUsdRaw) {
+          metrics.incr('tradesRejected')
+          const reason = `Net $${fmtUsd(m.netProfitUsd)} below $${MIN_NET_PROFIT_USD} minimum`
+          logger.recordOutcome(buildRecord('rejected', _pair, priceInfo, m, { reason }))
+          logRejection(_pair, { metrics: m, reason })
+          return
+        }
+      }
     } else {
       printProfitabilityTable(_pair, m, token0)
     }
