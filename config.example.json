@@ -2,12 +2,12 @@
     "PROJECT_SETTINGS": {
         "isLocal": false,
         "isDeployed": false,
-        "ARBITRAGE_ADDRESS": "0x21dd08c28e8699dc613ACaF6978eD688Cc17aabF",
+        "ARBITRAGE_ADDRESS": "0xYourDeployedArbitrageContractAddress",
         "PRICE_UNITS": 0,
         "PRICE_DIFFERENCE": 0.5,
         "GAS_LIMIT": 600000,
         "GAS_PRICE": 0.00000001,
-        "DISCOVERY_CONCURRENCY": 8,
+        "DISCOVERY_CONCURRENCY": 3,
         "SKIP_STABLE_PAIRS": false,
         "EVAL_ONCE_PER_BLOCK": true
     },
@@ -17,7 +17,9 @@
         "SEARCH_STEPS": 20,
         "REFINE_ITERS": 12,
         "SAFETY_MARGIN_PCT": 0.05,
-        "MAX_COMBOS_EVALUATED": 6
+        "MAX_COMBOS_EVALUATED": 6,
+        "MAX_SPREAD_PCT": 50,
+        "MIN_LIQUIDITY_FRACTION": 0.02
     },
     "TOKENS": {
         "BASE": {
@@ -38,7 +40,7 @@
             "GMX": "0xfc5a1a6eb076a2c7ad06ed22c90d7e710e35ad0a",
             "PENDLE": "0x0c880f6761f1af8d9aa9c466984b80dab9a8c9e8"
         },
-        "FEE_TIERS": [100, 500, 2500, 3000, 10000],
+        "FEE_TIERS": [100, 500],
         "STABLES": [
             "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
             "0xff970a61a04b1ca14834a43f5de4533ebddb5cc8",

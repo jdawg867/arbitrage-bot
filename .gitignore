@@ -1,5 +1,9 @@
 node_modules
 .env
+# Live config (per-machine: your address, mode, keys' companion settings).
+# Copy config.example.json -> config.json and edit. Kept out of git so your
+# production settings never conflict on pull.
+config.json
 coverage
 coverage.json
 typechain

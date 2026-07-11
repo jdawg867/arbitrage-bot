@@ -118,6 +118,14 @@ Show private key. A headless bot cannot pop the extension, so it signs with this
 
 ### `config.json`
 
+`config.json` is **git-ignored** (per-machine, like `.env`) so your live settings
+never conflict on `git pull`. Create it from the template on each machine:
+```bash
+cp config.example.json config.json
+```
+then edit the values below. `config.example.json` (tracked) is monitor-safe
+defaults with a placeholder `ARBITRAGE_ADDRESS`.
+
 **`PROJECT_SETTINGS`**
 - `isLocal` — `true` = connect to local Hardhat node; `false` = live Arbitrum.
 - `isDeployed` — `true` = actually call the arbitrage contract on an opportunity;
