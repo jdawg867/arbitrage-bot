@@ -42,27 +42,49 @@ function createProvider() {
   return instrumentProvider(new ethers.WebSocketProvider(providerUrl()))
 }
 
-// -- SETUP UNISWAP/PANCAKESWAP CONTRACTS -- //
-// Router addresses are static config values, so cache them on the exchange
-// object instead of resolving contract.getAddress() on every trade evaluation.
+// -- DEX REGISTRY -- //
+// Known Uniswap-V3-style DEXes, keyed by a short id. Each maps to a top-level
+// config block ({ FACTORY_V3, QUOTER_V3, ROUTER_V3 }). `poolType` selects the
+// pool ABI: Pancake V3 emits a Swap event with extra fields, so it needs a
+// custom ABI; Uniswap and SushiSwap (a Uniswap V3 fork) use the standard one.
+// The factory/quoter/router interfaces are identical across all three.
+// To add another Uniswap-V3-fork DEX: add an entry here + a config block.
+const DEX_REGISTRY = [
+  { id: 'uni', name: 'Uniswap V3', poolType: 'univ3', configKey: 'UNISWAP' },
+  { id: 'pancake', name: 'Pancakeswap V3', poolType: 'pancakev3', configKey: 'PANCAKESWAP' },
+  { id: 'sushi', name: 'SushiSwap V3', poolType: 'univ3', configKey: 'SUSHISWAP' }
+]
+
+// Build every DEX that has a config block, keyed by id: { id, name, poolType,
+// routerAddress, factory, quoter, router }. Router addresses are cached (static
+// config) so trade paths need no getAddress() round-trip.
 function createExchanges(provider) {
-  const uniswap = {
-    name: "Uniswap V3",
-    routerAddress: ethers.getAddress(config.UNISWAP.ROUTER_V3),
-    factory: new ethers.Contract(config.UNISWAP.FACTORY_V3, IUniswapV3Factory.abi, provider),
-    quoter: new ethers.Contract(config.UNISWAP.QUOTER_V3, IQuoter.abi, provider),
-    router: new ethers.Contract(config.UNISWAP.ROUTER_V3, ISwapRouter.abi, provider)
+  const exchanges = {}
+  for (const d of DEX_REGISTRY) {
+    const c = config[d.configKey]
+    if (!c) continue // DEX not configured on this deployment — skip
+    // Checksum-validate every address up front so a bad/mis-cased config address
+    // fails loudly here instead of silently as a caught "bad address checksum"
+    // during discovery probes (which would just drop the DEX with no signal).
+    let factoryAddr, quoterAddr, routerAddr
+    try {
+      factoryAddr = ethers.getAddress(c.FACTORY_V3)
+      quoterAddr = ethers.getAddress(c.QUOTER_V3)
+      routerAddr = ethers.getAddress(c.ROUTER_V3)
+    } catch (err) {
+      throw new Error(`Invalid address in config.${d.configKey}: ${err.message}`)
+    }
+    exchanges[d.id] = {
+      id: d.id,
+      name: d.name,
+      poolType: d.poolType,
+      routerAddress: routerAddr,
+      factory: new ethers.Contract(factoryAddr, IUniswapV3Factory.abi, provider),
+      quoter: new ethers.Contract(quoterAddr, IQuoter.abi, provider),
+      router: new ethers.Contract(routerAddr, ISwapRouter.abi, provider)
+    }
   }
-
-  const pancakeswap = {
-    name: "Pancakeswap V3",
-    routerAddress: ethers.getAddress(config.PANCAKESWAP.ROUTER_V3),
-    factory: new ethers.Contract(config.PANCAKESWAP.FACTORY_V3, IUniswapV3Factory.abi, provider),
-    quoter: new ethers.Contract(config.PANCAKESWAP.QUOTER_V3, IQuoter.abi, provider),
-    router: new ethers.Contract(config.PANCAKESWAP.ROUTER_V3, ISwapRouter.abi, provider)
-  }
-
-  return { uniswap, pancakeswap }
+  return exchanges
 }
 
 // -- ARBITRAGE CONTRACT (EXECUTION MODE ONLY) -- //
