@@ -65,12 +65,18 @@ let latestBlock = 0
 // -- CONFIGURATION VALUES HERE -- //
 const UNITS = config.PROJECT_SETTINGS.PRICE_UNITS
 const PRICE_DIFFERENCE = config.PROJECT_SETTINGS.PRICE_DIFFERENCE
+// Evaluate each pool at most once per block (default on). Many swaps can land in
+// a single Arbitrum block; re-pricing the same pool for each is wasted RPC/CPU.
+const EVAL_ONCE_PER_BLOCK = config.PROJECT_SETTINGS.EVAL_ONCE_PER_BLOCK !== false
 
 // -- STRATEGY SETTINGS (config.json -> STRATEGY) -- //
 const MIN_PROFIT_BPS = config.STRATEGY.MIN_PROFIT_BPS       // min net profit as basis points of the flash amount
 const MAX_POOL_FRACTION = config.STRATEGY.MAX_POOL_FRACTION // never route more than this fraction of the buy pool
 const SEARCH_STEPS = config.STRATEGY.SEARCH_STEPS           // resolution of the coarse size grid
 const REFINE_ITERS = config.STRATEGY.REFINE_ITERS           // ternary-refinement iterations around the best grid point
+// Extra spread cushion (percentage points) added on top of the round-trip DEX
+// fee when computing the dynamic minimum spread pre-filter (see dynamicMinSpread).
+const SAFETY_MARGIN_PCT = config.STRATEGY.SAFETY_MARGIN_PCT ?? 0.05
 
 // WETH base lets us compare profit and gas directly (both ETH-denominated)
 const WETH_ADDRESS = ethers.getAddress(config.TOKENS.BASE.WETH)
@@ -157,6 +163,9 @@ const processing = new Set()
 // nonces never collide even though evaluations run concurrently. This preserves
 // the original "single trade at a time" behavior (execution mode only).
 let tradeInFlight = false
+
+// Block at which each pool was last evaluated, for once-per-block dedup.
+const lastEvalBlock = new Map()
 
 /**
  * EXECUTION MODE precondition check. Fails fast (before we even connect) with an
@@ -327,11 +336,11 @@ const main = async () => {
  * "No Arbitrage Available". Shows spread vs. minimum for below-threshold
  * spreads, and the gross/gas/net breakdown when a full round-trip was priced.
  */
-const logRejection = (_pair, { spreadPct, reason, metrics: m }) => {
+const logRejection = (_pair, { spreadPct, minSpreadPct, reason, metrics: m }) => {
   console.log(`Rejected — ${_pair.label}`)
   if (spreadPct !== undefined) {
     console.log(`  Spread:   ${spreadPct.toFixed(2)}%`)
-    console.log(`  Minimum:  ${Number(PRICE_DIFFERENCE).toFixed(2)}%`)
+    console.log(`  Minimum:  ${Number(minSpreadPct ?? PRICE_DIFFERENCE).toFixed(2)}%`)
   }
   const t0 = _pair.token0
   if (m && m.grossProfit !== undefined) {
@@ -352,20 +361,25 @@ const eventHandler = async (_pair) => {
 
   // Ignore overlapping/duplicate events for the SAME pool while it's in flight.
   if (processing.has(_pair.key)) return
+  // Once-per-block dedup: skip if we already priced this pool at this block.
+  if (EVAL_ONCE_PER_BLOCK && lastEvalBlock.get(_pair.key) === latestBlock) return
   processing.add(_pair.key)
+  lastEvalBlock.set(_pair.key, latestBlock)
 
   const startedAt = Date.now()
   try {
     metrics.incr('swapsEvaluated')
 
     const priceInfo = await checkPrice(_pair)
-    const exchangePath = await determineDirection(priceInfo.priceDifference)
+    const minSpread = dynamicMinSpread(_pair.fee)
+    const exchangePath = await determineDirection(priceInfo.priceDifference, minSpread)
 
     if (!exchangePath) {
-      // Spread below threshold — the common case.
+      // Spread below the dynamic minimum (can't cover DEX fees) — the common case.
       logRejection(_pair, {
         spreadPct: Math.abs(Number(priceInfo.priceDifference)),
-        reason: 'Spread below threshold'
+        minSpreadPct: minSpread,
+        reason: 'Spread below dynamic minimum (fees)'
       })
       return
     }
@@ -448,17 +462,32 @@ const checkPrice = async (_pair) => {
   return { uPrice: uPriceNum, pPrice: pPriceNum, priceDifference }
 }
 
-const determineDirection = async (_priceDifference) => {
+/**
+ * Dynamic minimum spread (%) a pair must show before we run the full
+ * profitability calc. It's the round-trip DEX fee (both swaps at this pool's fee
+ * tier) plus a safety margin, floored at the configured PRICE_DIFFERENCE — so we
+ * never LOWER the bar, only RAISE it for high-fee tiers where a small spread
+ * can't possibly cover fees (the 10000 tier needs >2% just for fees). Balancer
+ * flash loans are free, so there's no flash-fee term. Gas remains enforced by
+ * the full calc downstream; this is a cheap pre-filter (zero RPC) that skips
+ * opportunities that are mathematically incapable of profit.
+ */
+const dynamicMinSpread = (_fee) => {
+  const dexRoundTripPct = (2 * _fee) / 10000 // fee is millionths: 500 -> 0.10%, 10000 -> 2.00%
+  return Math.max(PRICE_DIFFERENCE, dexRoundTripPct + SAFETY_MARGIN_PCT)
+}
+
+const determineDirection = async (_priceDifference, _minSpread = PRICE_DIFFERENCE) => {
   console.log(`Determining Direction...\n`)
 
-  if (_priceDifference >= PRICE_DIFFERENCE) {
+  if (_priceDifference >= _minSpread) {
 
     console.log(`Potential Arbitrage Direction:\n`)
     console.log(`Buy\t -->\t ${uniswap.name}`)
     console.log(`Sell\t -->\t ${pancakeswap.name}\n`)
     return [uniswap, pancakeswap]
 
-  } else if (_priceDifference <= -(PRICE_DIFFERENCE)) {
+  } else if (_priceDifference <= -(_minSpread)) {
 
     console.log(`Potential Arbitrage Direction:\n`)
     console.log(`Buy\t -->\t ${pancakeswap.name}`)

@@ -8,13 +8,15 @@
         "GAS_LIMIT": 600000,
         "GAS_PRICE": 0.00000001,
         "DISCOVERY_CONCURRENCY": 8,
-        "SKIP_STABLE_PAIRS": true
+        "SKIP_STABLE_PAIRS": false,
+        "EVAL_ONCE_PER_BLOCK": true
     },
     "STRATEGY": {
         "MIN_PROFIT_BPS": 10,
         "MAX_POOL_FRACTION": 0.05,
         "SEARCH_STEPS": 20,
-        "REFINE_ITERS": 12
+        "REFINE_ITERS": 12,
+        "SAFETY_MARGIN_PCT": 0.05
     },
     "TOKENS": {
         "BASE": {
