@@ -410,12 +410,16 @@ const eventHandler = async (_pair) => {
   const startedAt = Date.now()
   try {
     metrics.incr('swapsEvaluated')
-    console.log(`Swap on ${_pair.label} @ block ${latestBlock} — pricing ${_pair.pools.length} pools...\n`)
+    // Routine per-swap chatter is DEBUG-only — hyperactive pools (e.g. PENDLE/WETH
+    // trading every block) would otherwise flood the log. The console only speaks
+    // below once a route actually clears the fee floor; the dashboard's runtime
+    // panel tracks the quiet activity (swaps received/evaluated).
+    dbg(`Swap on ${_pair.label} @ block ${latestBlock} — pricing ${_pair.pools.length} pools`)
 
     // 1) Spot-price every pool, then form all ordered buy/sell combos.
     const priced = await pricePools(_pair)
     if (priced.length < 2) {
-      logRejection(_pair, { reason: `Only ${priced.length} pool(s) priceable this block` })
+      dbg(`skip ${_pair.label}: only ${priced.length} pool(s) priceable this block`)
       return
     }
     const candidates = buildCandidates(priced)
@@ -423,7 +427,7 @@ const eventHandler = async (_pair) => {
 
     if (viable.length === 0) {
       const top = candidates[0] // best spread, still below its fee floor
-      logRejection(_pair, { spreadPct: top.spreadPct, minSpreadPct: top.minPct, reason: 'No route spread clears fees' })
+      dbg(`no-op ${_pair.label}: best spread ${top.spreadPct.toFixed(2)}% < min ${top.minPct.toFixed(2)}%`)
       return
     }
 
@@ -538,7 +542,7 @@ const eventHandler = async (_pair) => {
   } finally {
     processing.delete(_pair.key)
     metrics.recordEvalTime(Date.now() - startedAt)
-    console.log("\nWaiting for swap event...\n")
+    dbg('waiting for swap event')
   }
 }
 
