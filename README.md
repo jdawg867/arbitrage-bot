@@ -312,6 +312,30 @@ pair, and a recent-trades table. It auto-refreshes every 15s. Endpoints:
 On a VPS this port is internet-facing — see *Walkthrough B → step 5* to protect it with
 basic auth (`DASHBOARD_USER`/`DASHBOARD_PASS`) and/or a firewall.
 
+## Production resilience & observability
+
+Built for unattended 24/7 operation:
+
+- **Runtime health panel** — the dashboard shows live counters for the current
+  process: uptime, swaps received/evaluated, opportunities found, profitable
+  opportunities, trades executed/rejected, average evaluation time, RPC
+  requests, RPC retries, and websocket reconnects. Also at `GET /api/metrics`.
+- **Auto-reconnect** — if the Alchemy websocket drops, the bot rebuilds the
+  provider, contracts and Swap subscriptions with backoff (1s→10s) and resumes
+  automatically. No re-discovery, no manual restart.
+- **Transient-failure retries** — RPC calls that hit a 429 ("compute units per
+  second") or a socket hiccup are retried with backoff (250ms→2s); permanent
+  errors (reverts) fail fast. A failed event is abandoned, never fatal.
+- **Reduced RPC** — block height comes from a single push subscription (not a
+  per-swap `getBlockNumber`), pool addresses and router addresses are cached
+  from discovery/config, and token metadata is cached — cutting Alchemy compute
+  units substantially versus a naive per-event approach.
+- **Per-pool concurrency** — each pool has its own processing lock (duplicate
+  Swap events for a busy pool are dropped), while a single global mutex still
+  serializes actual trades so nonces can't collide.
+- **Structured rejection logs** — every rejection states *why* (spread vs.
+  minimum, or the gross/gas/net breakdown, or the liquidity/quote reason).
+
 ## Project layout
 
 ```
@@ -323,9 +347,11 @@ scripts/deploy.js          # deploy the Arbitrage contract
 scripts/manipulate.js      # move a pool's price to test the bot locally
 scripts/discover-test.js   # read-only discovery check against a public RPC
 helpers/helpers.js         # discoverPairs, price calc, pool/token helpers
-helpers/initialization.js  # provider + DEX/contract setup
+helpers/initialization.js  # provider + DEX/contract connection factories
 helpers/abi.js             # pool ABIs (incl. Pancakeswap's custom Swap event)
 helpers/logger.js          # append-only trade/opportunity logging, stats, CSV export
+helpers/metrics.js         # in-process runtime metrics (dashboard health panel)
+helpers/rpc.js             # withRetry: transient-failure backoff for RPC calls
 helpers/server.js          # express server: dashboard + JSON/CSV API (optional auth)
 helpers/public/index.html  # the stats dashboard (single self-contained page)
 logs/                      # trades.jsonl + opportunities.jsonl (gitignored)
