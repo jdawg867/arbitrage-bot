@@ -126,9 +126,17 @@ const buildExecutedRecord = async (_pair, priceInfo, metrics, exec) => {
   }
 }
 
-// Global lock so we only ever work a single opportunity at a time (avoids nonce
-// collisions and overlapping trades when many pools fire events at once).
-let isExecuting = false
+// -- CONCURRENCY --
+// Per-pool processing lock: while a pool is being evaluated, additional Swap
+// events for THAT SAME pool are ignored (a single block can emit many). Keyed
+// by pair.key = (token0, token1, fee). Different pools still evaluate
+// concurrently, so a slow evaluation on one pair no longer blocks the others.
+const processing = new Set()
+
+// Global execution mutex: at most ONE trade may be in flight at a time, so
+// nonces never collide even though evaluations run concurrently. This preserves
+// the original "single trade at a time" behavior (execution mode only).
+let tradeInFlight = false
 
 /**
  * EXECUTION MODE precondition check. Fails fast (before any pools are watched)
@@ -207,41 +215,90 @@ const main = async () => {
   console.log(`Monitoring ${discovered.length} pair(s). Waiting for swap event...\n`)
 }
 
-const eventHandler = async (_pair) => {
-  if (isExecuting) return
-  isExecuting = true
+/**
+ * Print a clear, structured reason for every rejection — never just
+ * "No Arbitrage Available". Shows spread vs. minimum for below-threshold
+ * spreads, and the gross/gas/net breakdown when a full round-trip was priced.
+ */
+const logRejection = (_pair, { spreadPct, reason, metrics: m }) => {
+  console.log(`Rejected — ${_pair.label}`)
+  if (spreadPct !== undefined) {
+    console.log(`  Spread:   ${spreadPct.toFixed(2)}%`)
+    console.log(`  Minimum:  ${Number(PRICE_DIFFERENCE).toFixed(2)}%`)
+  }
+  const t0 = _pair.token0
+  if (m && m.grossProfit !== undefined) {
+    console.log(`  Gross:    ${fmt(m.grossProfit, t0)} ${t0.symbol}`)
+    if (m.gasCostBase !== undefined && m.gasCostBase !== null) {
+      console.log(`  Gas:      ${fmt(m.gasCostBase, t0)} ${t0.symbol}`)
+    }
+    if (m.netProfit !== undefined && m.netProfit !== null) {
+      console.log(`  Net:      ${fmt(m.netProfit, t0)} ${t0.symbol}`)
+    }
+  }
+  console.log(`  Reason:   ${reason || 'Not profitable'}`)
+  console.log(`-----------------------------------------\n`)
+}
 
+const eventHandler = async (_pair) => {
+  metrics.incr('swapsReceived')
+
+  // Ignore overlapping/duplicate events for the SAME pool while it's in flight.
+  if (processing.has(_pair.key)) return
+  processing.add(_pair.key)
+
+  const startedAt = Date.now()
   try {
+    metrics.incr('swapsEvaluated')
+
     const priceInfo = await checkPrice(_pair)
     const exchangePath = await determineDirection(priceInfo.priceDifference)
 
     if (!exchangePath) {
-      // Spread below threshold — the common case; not logged, to keep the record clean
-      console.log(`No Arbitrage Currently Available on ${_pair.label}\n`)
-      console.log(`-----------------------------------------\n`)
+      // Spread below threshold — the common case.
+      logRejection(_pair, {
+        spreadPct: Math.abs(Number(priceInfo.priceDifference)),
+        reason: 'Spread below threshold'
+      })
       return
     }
 
-    const { isProfitable, amount, metrics, reason } = await determineProfitability(exchangePath, _pair)
+    metrics.incr('opportunitiesFound')
+
+    const { isProfitable, amount, metrics: oppMetrics, reason } = await determineProfitability(exchangePath, _pair)
 
     if (!isProfitable) {
-      logger.recordOutcome(buildRecord('rejected', _pair, priceInfo, metrics, { reason }))
-      console.log(`No Arbitrage Currently Available on ${_pair.label}\n`)
-      console.log(`-----------------------------------------\n`)
+      metrics.incr('tradesRejected')
+      logger.recordOutcome(buildRecord('rejected', _pair, priceInfo, oppMetrics, { reason }))
+      logRejection(_pair, { reason, metrics: oppMetrics })
       return
     }
+
+    metrics.incr('profitableOpportunities')
 
     if (!IS_EXECUTION_MODE) {
       // Monitor-only mode: record the detected opportunity but don't trade
-      logger.recordOutcome(buildRecord('detected', _pair, priceInfo, metrics, {}))
-      console.log(`Profitable opportunity detected on ${_pair.label} (monitor mode; set isDeployed=true to trade)\n`)
+      logger.recordOutcome(buildRecord('detected', _pair, priceInfo, oppMetrics, {}))
+      console.log(`Profitable opportunity DETECTED on ${_pair.label} (monitor mode; set isDeployed=true to trade)\n`)
       console.log(`-----------------------------------------\n`)
       return
     }
 
-    const exec = await executeTrade(exchangePath, _pair, amount)
-    logger.recordOutcome(await buildExecutedRecord(_pair, priceInfo, metrics, exec))
-    console.log(`Trade logged${exec.txHash ? ` (tx ${exec.txHash})` : ''}\n`)
+    // Execution mode: serialize the actual send. If a trade is already in
+    // flight, skip this one — the next swap on this pair will re-trigger us.
+    if (tradeInFlight) {
+      console.log(`Skipping ${_pair.label}: another trade is already in flight.\n`)
+      return
+    }
+    tradeInFlight = true
+    try {
+      const exec = await executeTrade(exchangePath, _pair, amount)
+      metrics.incr('tradesExecuted')
+      logger.recordOutcome(await buildExecutedRecord(_pair, priceInfo, oppMetrics, exec))
+      console.log(`Trade logged${exec.txHash ? ` (tx ${exec.txHash})` : ''}\n`)
+    } finally {
+      tradeInFlight = false
+    }
   } catch (error) {
     console.log(error)
     logger.recordOutcome({
@@ -249,7 +306,8 @@ const eventHandler = async (_pair) => {
       reason: error.message || String(error)
     })
   } finally {
-    isExecuting = false
+    processing.delete(_pair.key)
+    metrics.recordEvalTime(Date.now() - startedAt)
     console.log("\nWaiting for swap event...\n")
   }
 }
@@ -599,9 +657,8 @@ const determineProfitability = async (_exchangePath, _pair) => {
     return { isProfitable: true, amount: flashAmount, metrics: m }
 
   } catch (error) {
+    // The caller (eventHandler) prints a structured rejection via logRejection().
     const reason = error.message || String(error)
-    console.log(`Not profitable: ${reason}`)
-    console.log("")
     return { isProfitable: false, amount: 0, metrics: m, reason }
   }
 }
