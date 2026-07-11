@@ -16,7 +16,8 @@
         "MAX_POOL_FRACTION": 0.05,
         "SEARCH_STEPS": 20,
         "REFINE_ITERS": 12,
-        "SAFETY_MARGIN_PCT": 0.05
+        "SAFETY_MARGIN_PCT": 0.05,
+        "MAX_COMBOS_EVALUATED": 6
     },
     "TOKENS": {
         "BASE": {

@@ -75,8 +75,28 @@ const MAX_POOL_FRACTION = config.STRATEGY.MAX_POOL_FRACTION // never route more 
 const SEARCH_STEPS = config.STRATEGY.SEARCH_STEPS           // resolution of the coarse size grid
 const REFINE_ITERS = config.STRATEGY.REFINE_ITERS           // ternary-refinement iterations around the best grid point
 // Extra spread cushion (percentage points) added on top of the round-trip DEX
-// fee when computing the dynamic minimum spread pre-filter (see dynamicMinSpread).
+// fee when computing the per-combo minimum spread pre-filter (see feeFloorPct).
 const SAFETY_MARGIN_PCT = config.STRATEGY.SAFETY_MARGIN_PCT ?? 0.05
+// Cap on how many viable buy/sell combos get the full (expensive) size search
+// per swap — we take the top-N by spot spread. Bounds RPC when a pair has many
+// pools and several routes clear the fee floor at once.
+const MAX_COMBOS_EVALUATED = config.STRATEGY.MAX_COMBOS_EVALUATED ?? 6
+
+// -- SANITY BOUNDS (degenerate-pool guards) --
+// A token1/token0 spot price outside [PRICE_SANITY_MIN, PRICE_SANITY_MAX], or a
+// spot spread above MAX_SPREAD_PCT, means a degenerate/near-empty pool sitting at
+// an extreme tick — not a real market. Such pools/routes are dropped before they
+// can produce absurd spreads (e.g. 3.4e40%). Real cross-DEX/cross-fee spreads on
+// the same pair are at most a few percent, so these bounds never exclude a
+// genuine opportunity. Base tokens are all normal-value (WETH/USDC/USDT), so
+// legitimate token1/token0 prices sit far inside the price band.
+const PRICE_SANITY_MIN = 1e-12
+const PRICE_SANITY_MAX = 1e12
+const MAX_SPREAD_PCT = config.STRATEGY.MAX_SPREAD_PCT ?? 50
+
+// Opt-in verbose debug logging (set DEBUG=1 in the env, or PROJECT_SETTINGS.DEBUG).
+const DEBUG = process.env.DEBUG === '1' || config.PROJECT_SETTINGS.DEBUG === true
+const dbg = (...args) => { if (DEBUG) console.log('[debug]', ...args) }
 
 // WETH base lets us compare profit and gas directly (both ETH-denominated)
 const WETH_ADDRESS = ethers.getAddress(config.TOKENS.BASE.WETH)
@@ -89,17 +109,18 @@ const fmt = (value, token) => ethers.formatUnits(value, token.decimals)
 const fmtOrNull = (raw, token) => (raw === null || raw === undefined ? null : ethers.formatUnits(raw, token.decimals))
 const fmtUsd = (raw) => (raw === null || raw === undefined ? null : ethers.formatUnits(raw, USDC_DECIMALS))
 
-// Common fields shared by every logged outcome
+// Common fields shared by every logged outcome. priceInfo describes the best
+// combo's spot prices/spread (a pair now spans many pools, so there is no single
+// "uniswap vs pancakeswap" price).
 const baseRecord = (status, _pair, priceInfo) => ({
   time: new Date().toISOString(),
   status,
   pair: _pair.label,
-  fee: _pair.fee,
   base: { symbol: _pair.token0.symbol, address: _pair.token0.address, decimals: _pair.token0.decimals },
   quote: { symbol: _pair.token1.symbol, address: _pair.token1.address },
-  priceUniswap: priceInfo ? priceInfo.uPrice : null,
-  pricePancakeswap: priceInfo ? priceInfo.pPrice : null,
-  priceDiffPct: priceInfo ? Number(priceInfo.priceDifference) : null
+  buyPrice: priceInfo ? priceInfo.buyPrice : null,
+  sellPrice: priceInfo ? priceInfo.sellPrice : null,
+  spreadPct: priceInfo ? priceInfo.spreadPct : null
 })
 
 // Build a log record for a rejected / detected outcome from the quoted metrics
@@ -110,6 +131,8 @@ const buildRecord = (status, _pair, priceInfo, metrics, extra = {}) => {
     ...baseRecord(status, _pair, priceInfo),
     buyOn: m.buyOn ?? null,
     sellOn: m.sellOn ?? null,
+    buyFee: m.buyFee ?? null,
+    sellFee: m.sellFee ?? null,
     flashAmount: fmtOrNull(m.flashAmount, t0),
     grossProfit: fmtOrNull(m.grossProfit, t0),
     gasCostEth: m.gasCostWei !== undefined ? ethers.formatUnits(m.gasCostWei, 18) : null,
@@ -137,6 +160,8 @@ const buildExecutedRecord = async (_pair, priceInfo, metrics, exec) => {
     ...baseRecord('executed', _pair, priceInfo),
     buyOn: m.buyOn ?? null,
     sellOn: m.sellOn ?? null,
+    buyFee: m.buyFee ?? null,
+    sellFee: m.sellFee ?? null,
     flashAmount: fmtOrNull(m.flashAmount, t0),
     grossProfit: fmtOrNull(realizedGross, t0),
     gasCostEth: ethers.formatUnits(exec.gasSpentWei, 18),
@@ -153,9 +178,9 @@ const buildExecutedRecord = async (_pair, priceInfo, metrics, exec) => {
 }
 
 // -- CONCURRENCY --
-// Per-pool processing lock: while a pool is being evaluated, additional Swap
-// events for THAT SAME pool are ignored (a single block can emit many). Keyed
-// by pair.key = (token0, token1, fee). Different pools still evaluate
+// Per-pair processing lock: while a pair is being evaluated, additional Swap
+// events for ANY of that pair's pools are ignored (a single block can emit
+// many). Keyed by pair.key = (token0, token1). Different pairs still evaluate
 // concurrently, so a slow evaluation on one pair no longer blocks the others.
 const processing = new Set()
 
@@ -215,28 +240,43 @@ const buildConnection = () => {
   attachDisconnectHandler()
 }
 
+// Resolve a discovered pool's DEX id to the CURRENT exchange object (rebuilt on
+// each reconnect), so pool contracts and quoters always use the live provider.
+const exchangeFor = (dexId) => (dexId === 'uni' ? uniswap : pancakeswap)
+
 // Rebuild pool contracts for every discovered pair against the CURRENT provider
-// and subscribe to both sides' Swap events. Old listeners are torn down first so
-// a reconnect never leaves duplicate subscriptions behind.
+// and subscribe to the Swap event on ALL of the pair's pools (any swap on any
+// pool re-evaluates the whole pair). Old listeners are torn down first so a
+// reconnect never leaves duplicate subscriptions behind.
 const subscribeAll = () => {
   for (const p of watchedPairs) {
-    try { p.uPool.removeAllListeners(); p.pPool.removeAllListeners() } catch (e) { /* dead socket */ }
+    for (const pool of p.pools) {
+      try { pool.contract.removeAllListeners() } catch (e) { /* dead socket */ }
+    }
   }
 
   watchedPairs = discoveredPairs.map((p) => {
-    const uPool = getPoolContractByAddress(uniswap, p.uPoolAddress, provider)
-    const pPool = getPoolContractByAddress(pancakeswap, p.pPoolAddress, provider)
+    const pools = p.pools.map((pool) => {
+      const exchange = exchangeFor(pool.dexId)
+      return {
+        dexId: pool.dexId,
+        dexName: pool.dexName,
+        fee: pool.fee,
+        address: pool.address,
+        exchange,
+        contract: getPoolContractByAddress(exchange, pool.address, provider)
+      }
+    })
     const pair = {
-      key: p.key, // stable (addr,addr,fee) id used by the per-pool processing lock
+      key: p.key, // stable (token0,token1) id used by the per-pair processing lock
       label: p.label,
       token0: p.token0,
       token1: p.token1,
-      fee: p.fee,
-      uPool,
-      pPool
+      pools
     }
-    uPool.on('Swap', () => eventHandler(pair))
-    pPool.on('Swap', () => eventHandler(pair))
+    for (const pool of pools) {
+      pool.contract.on('Swap', () => eventHandler(pair))
+    }
     return pair
   })
 }
@@ -266,7 +306,7 @@ const scheduleReconnect = async () => {
 
   // Best-effort teardown of the dead connection and its stale, provider-bound caches.
   try { provider.websocket.onclose = null; provider.websocket.onerror = null } catch (e) { /* noop */ }
-  try { for (const p of watchedPairs) { p.uPool.removeAllListeners(); p.pPool.removeAllListeners() } } catch (e) { /* noop */ }
+  try { for (const p of watchedPairs) { for (const pool of p.pools) pool.contract.removeAllListeners() } } catch (e) { /* noop */ }
   try { await provider.destroy() } catch (e) { /* noop */ }
   _gasPoolCache.clear()   // held quoter refs bound to the dead provider
   _usdcPoolCache.clear()
@@ -359,9 +399,9 @@ const logRejection = (_pair, { spreadPct, minSpreadPct, reason, metrics: m }) =>
 const eventHandler = async (_pair) => {
   metrics.incr('swapsReceived')
 
-  // Ignore overlapping/duplicate events for the SAME pool while it's in flight.
+  // Ignore overlapping/duplicate events for the SAME pair while it's in flight.
   if (processing.has(_pair.key)) return
-  // Once-per-block dedup: skip if we already priced this pool at this block.
+  // Once-per-block dedup: skip if we already evaluated this pair at this block.
   if (EVAL_ONCE_PER_BLOCK && lastEvalBlock.get(_pair.key) === latestBlock) return
   processing.add(_pair.key)
   lastEvalBlock.set(_pair.key, latestBlock)
@@ -369,53 +409,121 @@ const eventHandler = async (_pair) => {
   const startedAt = Date.now()
   try {
     metrics.incr('swapsEvaluated')
+    console.log(`Swap on ${_pair.label} @ block ${latestBlock} — pricing ${_pair.pools.length} pools...\n`)
 
-    const priceInfo = await checkPrice(_pair)
-    const minSpread = dynamicMinSpread(_pair.fee)
-    const exchangePath = await determineDirection(priceInfo.priceDifference, minSpread)
+    // 1) Spot-price every pool, then form all ordered buy/sell combos.
+    const priced = await pricePools(_pair)
+    if (priced.length < 2) {
+      logRejection(_pair, { reason: `Only ${priced.length} pool(s) priceable this block` })
+      return
+    }
+    const candidates = buildCandidates(priced)
+    const viable = candidates.filter((c) => c.viable) // spot spread clears fee floor
 
-    if (!exchangePath) {
-      // Spread below the dynamic minimum (can't cover DEX fees) — the common case.
-      logRejection(_pair, {
-        spreadPct: Math.abs(Number(priceInfo.priceDifference)),
-        minSpreadPct: minSpread,
-        reason: 'Spread below dynamic minimum (fees)'
-      })
+    if (viable.length === 0) {
+      const top = candidates[0] // best spread, still below its fee floor
+      logRejection(_pair, { spreadPct: top.spreadPct, minSpreadPct: top.minPct, reason: 'No route spread clears fees' })
       return
     }
 
     metrics.incr('opportunitiesFound')
 
-    const { isProfitable, amount, metrics: oppMetrics, reason } = await determineProfitability(exchangePath, _pair)
+    // 2) Full size search on the top-N viable routes; rank by realised gross profit.
+    const shortlist = viable.slice(0, MAX_COMBOS_EVALUATED)
+    if (viable.length > shortlist.length) {
+      console.log(`${viable.length} routes clear fees; evaluating top ${shortlist.length} by spread.\n`)
+    }
+    const evaluated = (await Promise.all(shortlist.map((c) => evaluateCombo(_pair, c)))).filter(Boolean)
 
-    if (!isProfitable) {
+    if (evaluated.length === 0) {
       metrics.incr('tradesRejected')
-      logger.recordOutcome(buildRecord('rejected', _pair, priceInfo, oppMetrics, { reason }))
-      logRejection(_pair, { reason, metrics: oppMetrics })
+      logRejection(_pair, { spreadPct: shortlist[0].spreadPct, minSpreadPct: shortlist[0].minPct, reason: 'No route was gross-profitable after quoting' })
       return
     }
 
+    // Best route by gross profit (== best net; gas is ~route/size-independent).
+    const bestEval = evaluated.reduce((a, b) => (b.grossProfit > a.grossProfit ? b : a))
+    const combo = bestEval.combo
+    const token0 = _pair.token0
+
+    const m = {
+      buyOn: `${combo.buy.dexName} ${combo.buy.fee}`,
+      sellOn: `${combo.sell.dexName} ${combo.sell.fee}`,
+      buyFee: combo.buy.fee,
+      sellFee: combo.sell.fee,
+      flashAmount: bestEval.flashAmount,
+      grossProfit: bestEval.grossProfit,
+      roiPct: bestEval.roiPct,
+      sizeCapped: bestEval.capped
+    }
+    const priceInfo = { buyPrice: combo.buyPrice, sellPrice: combo.sellPrice, spreadPct: combo.spreadPct }
+
+    console.log(`Best route: ${m.buyOn} -> ${m.sellOn} (spot spread ${combo.spreadPct.toFixed(2)}%, ${evaluated.length}/${shortlist.length} routes profitable)\n`)
+
+    // 3) bps gate on the winning route (gross profit as a fraction of flash size).
+    const minProfit = (m.flashAmount * BigInt(MIN_PROFIT_BPS)) / 10000n
+    if (m.grossProfit < minProfit) {
+      metrics.incr('tradesRejected')
+      logger.recordOutcome(buildRecord('rejected', _pair, priceInfo, m, { reason: `below ${MIN_PROFIT_BPS} bps` }))
+      logRejection(_pair, { spreadPct: combo.spreadPct, minSpreadPct: combo.minPct, reason: `Profit below ${MIN_PROFIT_BPS} bps minimum`, metrics: m })
+      return
+    }
+
+    if (m.sizeCapped) {
+      console.log(`Note: optimal size hit the MAX_POOL_FRACTION cap (${MAX_POOL_FRACTION}); a larger trade may earn more (raise it knowingly — more slippage/risk).\n`)
+    }
+
+    // 4) EXECUTION-ONLY: real gas + net-of-gas gate, applied once to the winner.
+    if (IS_EXECUTION_MODE) {
+      let gasCostWei
+      try {
+        gasCostWei = await estimateTradeGas(combo, _pair, m.flashAmount)
+      } catch (err) {
+        metrics.incr('tradesRejected')
+        logger.recordOutcome(buildRecord('rejected', _pair, priceInfo, m, { reason: err.message }))
+        logRejection(_pair, { metrics: m, reason: err.message })
+        return
+      }
+      const gasCostBase = await gasCostInToken0(gasCostWei, token0)
+      const netProfit = gasCostBase === null ? null : m.grossProfit - gasCostBase
+      m.gasCostWei = gasCostWei
+      m.gasCostBase = gasCostBase
+      m.netProfit = netProfit
+
+      printProfitabilityTable(_pair, m, token0)
+
+      if (netProfit !== null && netProfit <= 0n) {
+        metrics.incr('tradesRejected')
+        logger.recordOutcome(buildRecord('rejected', _pair, priceInfo, m, { reason: 'Gross profit does not cover gas' }))
+        logRejection(_pair, { metrics: m, reason: 'Gross profit does not cover gas' })
+        return
+      }
+      m.gasCostUsd = await valueInUsdc(gasCostBase, token0)
+      m.netProfitUsd = await valueInUsdc(netProfit, token0)
+    } else {
+      printProfitabilityTable(_pair, m, token0)
+    }
+
+    m.grossProfitUsd = await valueInUsdc(m.grossProfit, token0)
     metrics.incr('profitableOpportunities')
 
     if (!IS_EXECUTION_MODE) {
-      // Monitor-only mode: record the detected opportunity but don't trade
-      logger.recordOutcome(buildRecord('detected', _pair, priceInfo, oppMetrics, {}))
-      console.log(`Profitable opportunity DETECTED on ${_pair.label} (monitor mode; set isDeployed=true to trade)\n`)
+      logger.recordOutcome(buildRecord('detected', _pair, priceInfo, m, {}))
+      console.log(`Profitable opportunity DETECTED on ${_pair.label}: ${m.buyOn} -> ${m.sellOn} (monitor mode; set isDeployed=true to trade)\n`)
       console.log(`-----------------------------------------\n`)
       return
     }
 
-    // Execution mode: serialize the actual send. If a trade is already in
-    // flight, skip this one — the next swap on this pair will re-trigger us.
+    // Execution mode: serialize the actual send so nonces can't collide.
     if (tradeInFlight) {
       console.log(`Skipping ${_pair.label}: another trade is already in flight.\n`)
       return
     }
     tradeInFlight = true
     try {
-      const exec = await executeTrade(exchangePath, _pair, amount)
+      const exec = await executeTrade(combo, _pair, m.flashAmount)
       metrics.incr('tradesExecuted')
-      logger.recordOutcome(await buildExecutedRecord(_pair, priceInfo, oppMetrics, exec))
+      logger.recordOutcome(await buildExecutedRecord(_pair, priceInfo, m, exec))
       console.log(`Trade logged${exec.txHash ? ` (tx ${exec.txHash})` : ''}\n`)
     } finally {
       tradeInFlight = false
@@ -433,70 +541,82 @@ const eventHandler = async (_pair) => {
   }
 }
 
-const checkPrice = async (_pair) => {
-  console.log(`Swap Detected on ${_pair.label}, Checking Price...\n`)
-
-  // Cached from the 'block' subscription — no getBlockNumber() RPC per swap
-  const currentBlock = latestBlock
-
-  const uPrice = await withRetry(() => calculatePrice(_pair.uPool, _pair.token0, _pair.token1), `price ${_pair.label} (uni)`)
-  const pPrice = await withRetry(() => calculatePrice(_pair.pPool, _pair.token0, _pair.token1), `price ${_pair.label} (pancake)`)
-
-  // Compute the % difference from the RAW prices (rounding to PRICE_UNITS first would
-  // collapse sub-1 prices to 0 and yield NaN for stablecoin-decimal pairs).
-  const uPriceNum = Number(uPrice)
-  const pPriceNum = Number(pPrice)
-  const priceDifference = pPriceNum === 0
-    ? '0.00'
-    : (((uPriceNum - pPriceNum) / pPriceNum) * 100).toFixed(2)
-
-  // Display legibly whether the price is ~60000 or ~0.0004
-  const show = (p) => (p >= 1 ? p.toFixed(UNITS) : p.toPrecision(6))
-
-  console.log(`Current Block: ${currentBlock}`)
-  console.log(`-----------------------------------------`)
-  console.log(`UNISWAP     | ${_pair.token1.symbol}/${_pair.token0.symbol}\t | ${show(uPriceNum)}`)
-  console.log(`PANCAKESWAP | ${_pair.token1.symbol}/${_pair.token0.symbol}\t | ${show(pPriceNum)}\n`)
-  console.log(`Percentage Difference: ${priceDifference}%\n`)
-
-  return { uPrice: uPriceNum, pPrice: pPriceNum, priceDifference }
+// Read the spot price (token1 per token0) of every pool of the pair, in
+// parallel, with transient-retry. Pools that can't be priced (empty/degenerate)
+// are dropped. Returns [{ pool, price }] for pools with a finite positive price.
+const pricePools = async (_pair) => {
+  const priced = []
+  await Promise.all(_pair.pools.map(async (pool) => {
+    try {
+      const raw = await withRetry(
+        () => calculatePrice(pool.contract, _pair.token0, _pair.token1),
+        `price ${_pair.label} ${pool.dexId}:${pool.fee}`
+      )
+      const price = Number(raw)
+      dbg(`price ${_pair.label} ${pool.dexId}:${pool.fee}`,
+        `dec(t0=${_pair.token0.decimals}, t1=${_pair.token1.decimals})`,
+        `token1/token0=${raw}`)
+      // Reject non-finite, zero/near-zero, or absurd prices — a degenerate pool
+      // at an extreme tick would otherwise blow up the spread ratio downstream.
+      if (!Number.isFinite(price) || price < PRICE_SANITY_MIN || price > PRICE_SANITY_MAX) {
+        dbg(`  dropped ${pool.dexId}:${pool.fee} — price ${price} out of sane range`)
+        return
+      }
+      priced.push({ pool, price })
+    } catch (e) {
+      // Unpriceable pool — skip it for this evaluation
+    }
+  }))
+  return priced
 }
 
-/**
- * Dynamic minimum spread (%) a pair must show before we run the full
- * profitability calc. It's the round-trip DEX fee (both swaps at this pool's fee
- * tier) plus a safety margin, floored at the configured PRICE_DIFFERENCE — so we
- * never LOWER the bar, only RAISE it for high-fee tiers where a small spread
- * can't possibly cover fees (the 10000 tier needs >2% just for fees). Balancer
- * flash loans are free, so there's no flash-fee term. Gas remains enforced by
- * the full calc downstream; this is a cheap pre-filter (zero RPC) that skips
- * opportunities that are mathematically incapable of profit.
- */
-const dynamicMinSpread = (_fee) => {
-  const dexRoundTripPct = (2 * _fee) / 10000 // fee is millionths: 500 -> 0.10%, 10000 -> 2.00%
+// Minimum spot spread (%) a buy->sell combo must show before we run the full
+// size search on it. It's the round-trip DEX fee (the two pools' fee tiers,
+// which may differ) plus a safety margin, floored at the configured
+// PRICE_DIFFERENCE so we never lower the operator's bar. Balancer flash loans
+// are free, so there's no flash-fee term; gas stays enforced by the full calc.
+const feeFloorPct = (_buyFee, _sellFee) => {
+  const dexRoundTripPct = (_buyFee + _sellFee) / 10000 // millionths -> %; 500+500 -> 0.10%
   return Math.max(PRICE_DIFFERENCE, dexRoundTripPct + SAFETY_MARGIN_PCT)
 }
 
-const determineDirection = async (_priceDifference, _minSpread = PRICE_DIFFERENCE) => {
-  console.log(`Determining Direction...\n`)
-
-  if (_priceDifference >= _minSpread) {
-
-    console.log(`Potential Arbitrage Direction:\n`)
-    console.log(`Buy\t -->\t ${uniswap.name}`)
-    console.log(`Sell\t -->\t ${pancakeswap.name}\n`)
-    return [uniswap, pancakeswap]
-
-  } else if (_priceDifference <= -(_minSpread)) {
-
-    console.log(`Potential Arbitrage Direction:\n`)
-    console.log(`Buy\t -->\t ${pancakeswap.name}`)
-    console.log(`Sell\t -->\t ${uniswap.name}\n`)
-    return [pancakeswap, uniswap]
-
-  } else {
-    return null
+/**
+ * Form every ordered (buy, sell) pool combination for the pair and keep only the
+ * ones whose SPOT spread clears the round-trip fee floor. This is the cheap
+ * pruning step: it turns N priced pools into <= N*(N-1) candidates and discards
+ * the ones that can't possibly profit, before any expensive quote search.
+ *
+ * Profit direction: buy token0->token1 where token1 is dear in token0 terms
+ * (high token1/token0 = buyPrice), then sell token1->token0 where it's cheap
+ * (low sellPrice). Gross spot spread ≈ buyPrice/sellPrice - 1.
+ * Returns viable candidates sorted by spot spread, best first.
+ */
+const buildCandidates = (_priced) => {
+  const candidates = []
+  for (const b of _priced) {
+    for (const s of _priced) {
+      if (b.pool === s.pool) continue
+      const spreadPct = (b.price / s.price - 1) * 100
+      // Guard against degenerate routes: a non-finite or implausibly large spread
+      // (> MAX_SPREAD_PCT) means one of the pools is broken/empty, not a real
+      // opportunity. Drop it entirely so it can't be searched or reported.
+      if (!Number.isFinite(spreadPct) || spreadPct > MAX_SPREAD_PCT) {
+        dbg(`skip degenerate route ${b.pool.dexId}:${b.pool.fee}->${s.pool.dexId}:${s.pool.fee}`,
+          `buyPrice=${b.price} sellPrice=${s.price} spread=${spreadPct}%`)
+        continue
+      }
+      const minPct = feeFloorPct(b.pool.fee, s.pool.fee)
+      dbg(`route ${b.pool.dexId}:${b.pool.fee}->${s.pool.dexId}:${s.pool.fee}`,
+        `buyPrice=${b.price} sellPrice=${s.price} spread=${spreadPct.toFixed(4)}% min=${minPct.toFixed(4)}%`)
+      candidates.push({
+        buy: b.pool, sell: s.pool,
+        buyPrice: b.price, sellPrice: s.price,
+        spreadPct, minPct,
+        viable: spreadPct >= minPct
+      })
+    }
   }
+  return candidates.sort((a, b) => b.spreadPct - a.spreadPct) // best spread first
 }
 
 // Cache of a working WETH/<base> pool per base token, so we don't re-probe every trade
@@ -592,29 +712,30 @@ const valueInUsdc = async (amountRaw, token) => {
   return null
 }
 
-// The contract's executeTrade takes the two router addresses and the two-token
-// path. Both determineProfitability (gas estimate) and executeTrade need these,
-// so build them in one place. exchangePath[0] is the buy DEX, [1] is the sell DEX.
-// exchange.routerAddress is cached from config at startup, so this needs no RPC
-// and no contract.getAddress() round-trip. exchangePath[0]=buy, [1]=sell.
-const buildTradePaths = (_exchangePath, _pair) => ({
-  routerPath: [_exchangePath[0].routerAddress, _exchangePath[1].routerAddress],
+// The contract's executeTrade takes the two router addresses, the two-token
+// path, and per-leg fees. Both the gas estimate and executeTrade need the
+// routers/tokens, so build them in one place. buy = combo.buy, sell = combo.sell;
+// exchange.routerAddress is cached from config (no RPC / no getAddress()).
+const buildTradePaths = (_combo, _pair) => ({
+  routerPath: [_combo.buy.exchange.routerAddress, _combo.sell.exchange.routerAddress],
   tokenPath: [_pair.token0.address, _pair.token1.address]
 })
 
 /**
  * EXECUTION MODE ONLY. Simulate the real executeTrade flash loan via estimateGas
  * — which runs the whole loan and reverts if it wouldn't repay — and return the
- * gas cost in wei. Requires the deployed contract (`arbitrage`) and `account`,
- * so it is only ever called from the execution-mode branch below.
+ * gas cost in wei. Passes the per-leg fee tiers (buy pool, sell pool), which may
+ * differ. Requires the deployed contract (`arbitrage`) and `account`.
  */
-const estimateTradeGas = async (_exchangePath, _pair, _flashAmount) => {
-  const { routerPath, tokenPath } = await buildTradePaths(_exchangePath, _pair)
+const estimateTradeGas = async (_combo, _pair, _flashAmount) => {
+  const { routerPath, tokenPath } = buildTradePaths(_combo, _pair)
   try {
     // A genuine revert (loan can't repay) is permanent and rethrown at once;
     // only 429/socket blips are retried.
     const gasUnits = await withRetry(
-      () => arbitrage.connect(account).executeTrade.estimateGas(routerPath, tokenPath, _pair.fee, _flashAmount),
+      () => arbitrage.connect(account).executeTrade.estimateGas(
+        routerPath, tokenPath, _combo.buy.fee, _combo.sell.fee, _flashAmount
+      ),
       `estimateGas ${_pair.label}`
     )
     const feeData = await withRetry(() => provider.getFeeData(), 'getFeeData')
@@ -625,14 +746,13 @@ const estimateTradeGas = async (_exchangePath, _pair, _flashAmount) => {
   }
 }
 
-// Pretty-print the evaluated opportunity. Gas / net-profit rows only appear in
+// Pretty-print the chosen opportunity. Gas / net-profit rows only appear in
 // execution mode (monitor mode never estimates gas), so they're printed
 // conditionally on whether gas metrics were populated.
-const printProfitabilityTable = (_pair, buy, sell, m, token0) => {
+const printProfitabilityTable = (_pair, m, token0) => {
   const data = {
     'Pair': _pair.label,
-    'Buy on': buy.name,
-    'Sell on': sell.name,
+    'Route': `${m.buyOn} -> ${m.sellOn}`,
     'Flash amount': `${fmt(m.flashAmount, token0)} ${token0.symbol}`,
     'Gross profit': `${fmt(m.grossProfit, token0)} ${token0.symbol}`,
     'ROI': `${m.roiPct.toFixed(4)}%`
@@ -652,187 +772,111 @@ const printProfitabilityTable = (_pair, buy, sell, m, token0) => {
 }
 
 /**
- * Decide whether this opportunity is worth trading, and at what size.
- *
- * The arbitrage contract executes two exactInput swaps:
- *   token0 --(buy on exchangePath[0])--> token1 --(sell on exchangePath[1])--> token0
- * so we quote exactly that and search for the flash-loan size that maximises the
- * token0 profit. DEX fees are already reflected in the quotes and Balancer's flash
- * loan is free, so the only remaining cost is gas.
- *
- * Returns { isProfitable, amount } where `amount` is the token0 flash-loan size.
+ * Maximise round-trip token0 profit over the feasible flash-loan range
+ * (0, maxFlash]. A coarse geometric grid locates the profit hump; ternary search
+ * refines the peak. Maximising GROSS profit also maximises NET, since gas is
+ * ~independent of trade size. Returns { amount, profit, capped } or null if no
+ * size is quotable. Shared by every buy/sell combo. `_roundTrip(amount)` returns
+ * the token0 profit for that flash size (or null if unquotable).
  */
-const determineProfitability = async (_exchangePath, _pair) => {
-  console.log(`Determining Profitability...\n`)
+const maximizeProfit = async (_roundTrip, _maxFlash) => {
+  const evaluate = async (amount) => ({ amount, profit: await _roundTrip(amount) })
 
-  const { token0, token1, fee } = _pair
-  const buy = _exchangePath[0]
-  const sell = _exchangePath[1]
+  // Coarse geometric grid up to maxFlash, de-duplicated and positive (small pools
+  // collapse the high-order shifts to 0/duplicates, which would waste quotes and
+  // break the neighbour bracketing).
+  const gridSet = new Set()
+  for (let i = SEARCH_STEPS; i >= 0; i--) {
+    const size = _maxFlash >> BigInt(i)
+    if (size > 0n) gridSet.add(size)
+  }
+  const grid = [...gridSet].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+  if (grid.length === 0) return null
 
-  // Metrics accumulated as we go, returned for logging (raw BigInt values)
-  const m = { buyOn: buy.name, sellOn: sell.name }
+  const coarse = (await Promise.all(grid.map(evaluate))).filter((r) => r.profit !== null)
+  if (coarse.length === 0) return null
 
+  let best = coarse.reduce((a, b) => (b.profit > a.profit ? b : a))
+
+  // Ternary refinement within the neighbours that bracket the peak (unimodal).
+  const bestIdx = grid.findIndex((a) => a === best.amount)
+  let lo = grid[Math.max(0, bestIdx - 1)]
+  let hi = grid[Math.min(grid.length - 1, bestIdx + 1)]
+  for (let i = 0; i < REFINE_ITERS && hi - lo > 1n; i++) {
+    const third = (hi - lo) / 3n
+    const m1 = lo + third
+    const m2 = hi - third
+    const [r1, r2] = await Promise.all([evaluate(m1), evaluate(m2)])
+    const p1 = r1.profit ?? -1n
+    const p2 = r2.profit ?? -1n
+    if (p1 < p2) { lo = m1; if (p2 > best.profit) best = r2 }
+    else { hi = m2; if (p1 > best.profit) best = r1 }
+  }
+
+  return { amount: best.amount, profit: best.profit, capped: best.amount >= grid[grid.length - 1] }
+}
+
+/**
+ * Full profitability of ONE buy->sell combo: size the trade to maximise gross
+ * token0 profit and return its metrics, or null if it can't be quoted or isn't
+ * gross-profitable. Quotes use the BUY pool's fee tier for token0->token1 and the
+ * SELL pool's for token1->token0 (they may differ — this is what makes
+ * cross-fee-tier routes work). DEX fees + slippage are reflected in the quotes;
+ * Balancer's flash fee is 0. Gas + the net-of-gas gate are applied once to the
+ * winning combo in eventHandler (not per combo — that would be N gas estimates).
+ */
+const evaluateCombo = async (_pair, _combo) => {
+  const { token0, token1 } = _pair
+  const buy = _combo.buy
+  const sell = _combo.sell
   try {
-    // --- 1. Bound the trade size by the buy pool's token0 reserves ---
-    // Use the pool address resolved at discovery time (buy is one of the two
-    // exchange objects); avoids a redundant factory.getPool() RPC per evaluation.
-    const buyPool = buy.name === uniswap.name ? _pair.uPool : _pair.pPool
-    const [buyToken0Reserve] = await withRetry(
-      () => getPoolTokenBalances(buyPool.target, token0, token1),
-      `reserves ${_pair.label}`
+    // Bound size by the BUY pool's token0 reserves (its address is known).
+    const [buyReserve] = await withRetry(
+      () => getPoolTokenBalances(buy.address, token0, token1),
+      `reserves ${_pair.label} ${buy.dexId}:${buy.fee}`
     )
+    if (buyReserve === 0n) return null
+    const maxFlash = (buyReserve * BigInt(Math.round(MAX_POOL_FRACTION * 10000))) / 10000n
 
-    if (buyToken0Reserve === 0n) {
-      throw new Error("Buy pool has no token0 liquidity")
-    }
-
-    // Cap any single trade at MAX_POOL_FRACTION of the buy pool's token0
-    const maxFlash = (buyToken0Reserve * BigInt(Math.round(MAX_POOL_FRACTION * 10000))) / 10000n
-
-    // --- 2. Round-trip profit (token0) for a candidate flash amount, mirroring
-    //         the contract: token0 -> token1 (buy) -> token0 (sell). ---
-    const roundTripProfit = async (flashAmount) => {
+    // Round-trip: token0 --(buy pool, buy.fee)--> token1 --(sell pool, sell.fee)--> token0.
+    // Two OPPOSITE-direction quotes (token0->token1 then token1->token0), never two
+    // in the same direction — this is the actual flash-loan round trip.
+    const roundTrip = async (flashAmount) => {
       if (flashAmount <= 0n) return null
       try {
-        // Retry transient 429/socket blips per quote; a real "unquotable size"
-        // revert is permanent and falls through to the null return below.
-        const [token1Out] = await withRetry(() => buy.quoter.quoteExactInputSingle.staticCall({
-          tokenIn: token0.address, tokenOut: token1.address, amountIn: flashAmount, fee, sqrtPriceLimitX96: 0
+        const [token1Out] = await withRetry(() => buy.exchange.quoter.quoteExactInputSingle.staticCall({
+          tokenIn: token0.address, tokenOut: token1.address, amountIn: flashAmount, fee: buy.fee, sqrtPriceLimitX96: 0
         }), `quote-buy ${_pair.label}`)
-        const [token0Back] = await withRetry(() => sell.quoter.quoteExactInputSingle.staticCall({
-          tokenIn: token1.address, tokenOut: token0.address, amountIn: token1Out, fee, sqrtPriceLimitX96: 0
+        // Reject a zero/near-zero intermediate before quoting the second leg —
+        // a 0 amountIn would make the sell quote meaningless.
+        if (token1Out <= 0n) return null
+        const [token0Back] = await withRetry(() => sell.exchange.quoter.quoteExactInputSingle.staticCall({
+          tokenIn: token1.address, tokenOut: token0.address, amountIn: token1Out, fee: sell.fee, sqrtPriceLimitX96: 0
         }), `quote-sell ${_pair.label}`)
+        if (token0Back <= 0n) return null
+        dbg(`roundtrip ${buy.dexId}:${buy.fee}->${sell.dexId}:${sell.fee}`,
+          `in=${fmt(flashAmount, token0)} ${token0.symbol}`,
+          `mid=${fmt(token1Out, token1)} ${token1.symbol}`,
+          `out=${fmt(token0Back, token0)} ${token0.symbol}`,
+          `profit=${fmt(token0Back - flashAmount, token0)} ${token0.symbol}`)
         return token0Back - flashAmount
       } catch (err) {
-        // Size not quotable (e.g. exceeds available liquidity) — unusable
-        return null
+        return null // size not quotable (exceeds liquidity, etc.)
       }
     }
 
-    const evaluate = async (amount) => ({ amount, profit: await roundTripProfit(amount) })
+    const opt = await maximizeProfit(roundTrip, maxFlash)
+    if (!opt || opt.profit <= 0n) return null
 
-    // --- 3. Find the profit-maximising size over the feasible range ----------
-    // Feasible range is (0, maxFlash], where maxFlash = MAX_POOL_FRACTION of the
-    // buy pool's token0 — a deliberate slippage/risk cap, not an optimizer limit.
-    // Profit vs. size is a single hump (too small earns nothing; too big lets
-    // slippage eat the spread), so a coarse geometric grid locates the hump and a
-    // ternary search refines the peak. We maximise GROSS round-trip profit;
-    // because gas is essentially independent of trade size, argmax(gross) ==
-    // argmax(gross - gas) == argmax(net), so this also maximises net-of-gas profit.
-
-    // Coarse geometric grid up to maxFlash. De-duplicate and drop non-positive
-    // sizes: for small pools the high-order right-shifts collapse to 0/duplicates,
-    // which waste quotes and would break the neighbour bracketing below. Keeping
-    // the grid a clean ascending set makes the bracketing exact.
-    const gridSet = new Set()
-    for (let i = SEARCH_STEPS; i >= 0; i--) {
-      const size = maxFlash >> BigInt(i)
-      if (size > 0n) gridSet.add(size)
+    return {
+      combo: _combo,
+      flashAmount: opt.amount,
+      grossProfit: opt.profit,
+      roiPct: Number((opt.profit * 1000000n) / opt.amount) / 10000,
+      capped: opt.capped
     }
-    const grid = [...gridSet].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
-
-    if (grid.length === 0) {
-      throw new Error("Buy pool token0 liquidity too small to size a trade")
-    }
-
-    const coarse = (await Promise.all(grid.map(evaluate))).filter(r => r.profit !== null)
-
-    if (coarse.length === 0) {
-      throw new Error("No quotable trade size for this pair")
-    }
-
-    let best = coarse.reduce((a, b) => (b.profit > a.profit ? b : a))
-
-    // Ternary refinement within the grid neighbours that bracket the peak. For a
-    // unimodal profit curve the continuous optimum lies between the best grid
-    // point's neighbours, so this converges on the true maximum.
-    const bestIdx = grid.findIndex((a) => a === best.amount)
-    let lo = grid[Math.max(0, bestIdx - 1)]
-    let hi = grid[Math.min(grid.length - 1, bestIdx + 1)]
-    for (let i = 0; i < REFINE_ITERS && hi - lo > 1n; i++) {
-      const third = (hi - lo) / 3n
-      const m1 = lo + third
-      const m2 = hi - third
-      const [r1, r2] = await Promise.all([evaluate(m1), evaluate(m2)])
-      const p1 = r1.profit ?? -1n
-      const p2 = r2.profit ?? -1n
-      if (p1 < p2) {
-        lo = m1
-        if (p2 > best.profit) best = r2
-      } else {
-        hi = m2
-        if (p1 > best.profit) best = r1
-      }
-    }
-
-    const grossProfit = best.profit
-    const flashAmount = best.amount
-    m.flashAmount = flashAmount
-    m.grossProfit = grossProfit
-
-    // Surface when the optimum sits at the top of the feasible range: profit was
-    // still climbing at the MAX_POOL_FRACTION cap, so the cap — not the market —
-    // is the binding constraint and a larger trade could earn more. The operator
-    // can then raise MAX_POOL_FRACTION knowingly (it trades off slippage/risk).
-    m.sizeCapped = flashAmount >= grid[grid.length - 1]
-    if (m.sizeCapped && grossProfit > 0n) {
-      console.log(`Note: optimal size hit the MAX_POOL_FRACTION cap (${MAX_POOL_FRACTION} of buy-pool token0); a larger trade may be more profitable — raise MAX_POOL_FRACTION to capture it (more slippage/risk).\n`)
-    }
-
-    // --- 4. Profitability gates ---
-    if (grossProfit <= 0n) {
-      throw new Error("No profitable size found (spread doesn't cover slippage + DEX fees)")
-    }
-
-    // ROI gate: gross profit must be at least MIN_PROFIT_BPS of the flash amount
-    const minProfit = (flashAmount * BigInt(MIN_PROFIT_BPS)) / 10000n
-    if (grossProfit < minProfit) {
-      throw new Error(`Profit ${fmt(grossProfit, token0)} ${token0.symbol} below ${MIN_PROFIT_BPS} bps minimum (${fmt(minProfit, token0)})`)
-    }
-
-    // ROI (gross profit as a % of the flash amount) — reported in both modes
-    const roiPct = Number((grossProfit * 1000000n) / flashAmount) / 10000
-    m.roiPct = roiPct
-
-    // --- 5. EXECUTION-ONLY gates: real gas + net-of-gas profitability ---------
-    // MONITOR MODE stops after the gross-profit / bps gate above: there is no
-    // deployed contract to estimate gas against and we never send a tx, so we
-    // report gross-only metrics. EXECUTION MODE additionally simulates the real
-    // flash loan (estimateGas reverts if the loan can't be repaid), prices the
-    // gas in token0, and requires the profit to beat gas.
-    if (IS_EXECUTION_MODE) {
-      const gasCostWei = await estimateTradeGas(_exchangePath, _pair, flashAmount)
-
-      // Convert gas into token0 so we can check net profit for ANY base (WETH or stable)
-      const gasCostBase = await gasCostInToken0(gasCostWei, token0)
-      const netProfit = gasCostBase === null ? null : grossProfit - gasCostBase
-      m.gasCostWei = gasCostWei
-      m.gasCostBase = gasCostBase
-      m.netProfit = netProfit
-
-      printProfitabilityTable(_pair, buy, sell, m, token0)
-
-      // Require net > 0 whenever we could price gas; otherwise fall back to the bps gate
-      if (netProfit !== null && netProfit <= 0n) {
-        throw new Error("Gross profit does not cover gas")
-      }
-
-      // USD values for the tax log (best-effort; null if no pool to price them)
-      m.gasCostUsd = await valueInUsdc(gasCostBase, token0)
-      m.netProfitUsd = await valueInUsdc(netProfit, token0)
-    } else {
-      printProfitabilityTable(_pair, buy, sell, m, token0)
-    }
-
-    // Gross-profit USD value is logged in both modes (best-effort)
-    m.grossProfitUsd = await valueInUsdc(grossProfit, token0)
-
-    return { isProfitable: true, amount: flashAmount, metrics: m }
-
-  } catch (error) {
-    // The caller (eventHandler) prints a structured rejection via logRejection().
-    const reason = error.message || String(error)
-    return { isProfitable: false, amount: 0, metrics: m, reason }
+  } catch (err) {
+    return null
   }
 }
 
@@ -840,11 +884,11 @@ const determineProfitability = async (_exchangePath, _pair) => {
 // Arbitrage contract, then report the realized on-chain values for the trade
 // log. Only ever called from the execution-mode branch in eventHandler, so it
 // can assume `arbitrage` and `account` exist.
-const executeTrade = async (_exchangePath, _pair, _amount) => {
+const executeTrade = async (_combo, _pair, _amount) => {
   console.log(`Attempting Arbitrage...\n`)
 
   const _token0 = _pair.token0
-  const { routerPath, tokenPath } = await buildTradePaths(_exchangePath, _pair)
+  const { routerPath, tokenPath } = buildTradePaths(_combo, _pair)
 
   // Fetch token balances before
   const tokenBalanceBefore = await _token0.contract.balanceOf(account.address)
@@ -853,7 +897,8 @@ const executeTrade = async (_exchangePath, _pair, _amount) => {
   const transaction = await arbitrage.connect(account).executeTrade(
     routerPath,
     tokenPath,
-    _pair.fee,
+    _combo.buy.fee,
+    _combo.sell.fee,
     _amount
   )
 
