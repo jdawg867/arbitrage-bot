@@ -126,10 +126,18 @@ async function discoverPairs(_uniswap, _pancakeswap, _config, _provider) {
 
   // One flat probe per (token pair, DEX, fee tier), run at bounded concurrency so
   // discovery never bursts the RPC. (Total getPool calls are the same as before.)
+  // PROJECT_SETTINGS.DEXES selects which DEXes to use (default both). Set it to
+  // ["uni"] to run Uniswap-only cross-fee-tier arbitrage (both legs on deep
+  // Uniswap pools — no thin-Pancake bottleneck); ["pancake"] for Pancake-only.
+  const enabledDexes = _config.PROJECT_SETTINGS.DEXES || ['uni', 'pancake']
   const exchanges = [
     { id: 'uni', name: _uniswap.name, factory: _uniswap.factory },
     { id: 'pancake', name: _pancakeswap.name, factory: _pancakeswap.factory }
-  ]
+  ].filter((e) => enabledDexes.includes(e.id))
+
+  if (exchanges.length === 0) {
+    throw new Error(`No DEXes enabled — set PROJECT_SETTINGS.DEXES to include "uni" and/or "pancake".`)
+  }
   // Preflight: confirm the RPC can actually answer eth_call. A rate-limited or
   // mis-provisioned Alchemy key still answers eth_blockNumber but returns empty
   // data ("missing revert data") for every eth_call — which would make ALL the
@@ -140,7 +148,7 @@ async function discoverPairs(_uniswap, _pancakeswap, _config, _provider) {
     const c = tokenPairs[0]
     try {
       await withRetry(
-        () => _uniswap.factory.getPool(c.baseAddr, c.quoteAddr, feeTiers[0]),
+        () => exchanges[0].factory.getPool(c.baseAddr, c.quoteAddr, feeTiers[0]),
         'preflight getPool',
         { retryEmptyData: true }
       )

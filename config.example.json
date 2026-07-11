@@ -9,7 +9,8 @@
         "GAS_PRICE": 0.00000001,
         "DISCOVERY_CONCURRENCY": 3,
         "SKIP_STABLE_PAIRS": false,
-        "EVAL_ONCE_PER_BLOCK": true
+        "EVAL_ONCE_PER_BLOCK": true,
+        "DEXES": ["uni", "pancake"]
     },
     "STRATEGY": {
         "MIN_PROFIT_BPS": 10,
