@@ -82,6 +82,22 @@ const SAFETY_MARGIN_PCT = config.STRATEGY.SAFETY_MARGIN_PCT ?? 0.05
 // pools and several routes clear the fee floor at once.
 const MAX_COMBOS_EVALUATED = config.STRATEGY.MAX_COMBOS_EVALUATED ?? 6
 
+// -- SANITY BOUNDS (degenerate-pool guards) --
+// A token1/token0 spot price outside [PRICE_SANITY_MIN, PRICE_SANITY_MAX], or a
+// spot spread above MAX_SPREAD_PCT, means a degenerate/near-empty pool sitting at
+// an extreme tick — not a real market. Such pools/routes are dropped before they
+// can produce absurd spreads (e.g. 3.4e40%). Real cross-DEX/cross-fee spreads on
+// the same pair are at most a few percent, so these bounds never exclude a
+// genuine opportunity. Base tokens are all normal-value (WETH/USDC/USDT), so
+// legitimate token1/token0 prices sit far inside the price band.
+const PRICE_SANITY_MIN = 1e-12
+const PRICE_SANITY_MAX = 1e12
+const MAX_SPREAD_PCT = config.STRATEGY.MAX_SPREAD_PCT ?? 50
+
+// Opt-in verbose debug logging (set DEBUG=1 in the env, or PROJECT_SETTINGS.DEBUG).
+const DEBUG = process.env.DEBUG === '1' || config.PROJECT_SETTINGS.DEBUG === true
+const dbg = (...args) => { if (DEBUG) console.log('[debug]', ...args) }
+
 // WETH base lets us compare profit and gas directly (both ETH-denominated)
 const WETH_ADDRESS = ethers.getAddress(config.TOKENS.BASE.WETH)
 // USDC is used as the ~USD unit for logging profit/gas values for tax reporting
@@ -537,7 +553,16 @@ const pricePools = async (_pair) => {
         `price ${_pair.label} ${pool.dexId}:${pool.fee}`
       )
       const price = Number(raw)
-      if (Number.isFinite(price) && price > 0) priced.push({ pool, price })
+      dbg(`price ${_pair.label} ${pool.dexId}:${pool.fee}`,
+        `dec(t0=${_pair.token0.decimals}, t1=${_pair.token1.decimals})`,
+        `token1/token0=${raw}`)
+      // Reject non-finite, zero/near-zero, or absurd prices — a degenerate pool
+      // at an extreme tick would otherwise blow up the spread ratio downstream.
+      if (!Number.isFinite(price) || price < PRICE_SANITY_MIN || price > PRICE_SANITY_MAX) {
+        dbg(`  dropped ${pool.dexId}:${pool.fee} — price ${price} out of sane range`)
+        return
+      }
+      priced.push({ pool, price })
     } catch (e) {
       // Unpriceable pool — skip it for this evaluation
     }
@@ -572,7 +597,17 @@ const buildCandidates = (_priced) => {
     for (const s of _priced) {
       if (b.pool === s.pool) continue
       const spreadPct = (b.price / s.price - 1) * 100
+      // Guard against degenerate routes: a non-finite or implausibly large spread
+      // (> MAX_SPREAD_PCT) means one of the pools is broken/empty, not a real
+      // opportunity. Drop it entirely so it can't be searched or reported.
+      if (!Number.isFinite(spreadPct) || spreadPct > MAX_SPREAD_PCT) {
+        dbg(`skip degenerate route ${b.pool.dexId}:${b.pool.fee}->${s.pool.dexId}:${s.pool.fee}`,
+          `buyPrice=${b.price} sellPrice=${s.price} spread=${spreadPct}%`)
+        continue
+      }
       const minPct = feeFloorPct(b.pool.fee, s.pool.fee)
+      dbg(`route ${b.pool.dexId}:${b.pool.fee}->${s.pool.dexId}:${s.pool.fee}`,
+        `buyPrice=${b.price} sellPrice=${s.price} spread=${spreadPct.toFixed(4)}% min=${minPct.toFixed(4)}%`)
       candidates.push({
         buy: b.pool, sell: s.pool,
         buyPrice: b.price, sellPrice: s.price,
@@ -803,16 +838,27 @@ const evaluateCombo = async (_pair, _combo) => {
     if (buyReserve === 0n) return null
     const maxFlash = (buyReserve * BigInt(Math.round(MAX_POOL_FRACTION * 10000))) / 10000n
 
-    // Round-trip: token0 --(buy pool, buy.fee)--> token1 --(sell pool, sell.fee)--> token0
+    // Round-trip: token0 --(buy pool, buy.fee)--> token1 --(sell pool, sell.fee)--> token0.
+    // Two OPPOSITE-direction quotes (token0->token1 then token1->token0), never two
+    // in the same direction — this is the actual flash-loan round trip.
     const roundTrip = async (flashAmount) => {
       if (flashAmount <= 0n) return null
       try {
         const [token1Out] = await withRetry(() => buy.exchange.quoter.quoteExactInputSingle.staticCall({
           tokenIn: token0.address, tokenOut: token1.address, amountIn: flashAmount, fee: buy.fee, sqrtPriceLimitX96: 0
         }), `quote-buy ${_pair.label}`)
+        // Reject a zero/near-zero intermediate before quoting the second leg —
+        // a 0 amountIn would make the sell quote meaningless.
+        if (token1Out <= 0n) return null
         const [token0Back] = await withRetry(() => sell.exchange.quoter.quoteExactInputSingle.staticCall({
           tokenIn: token1.address, tokenOut: token0.address, amountIn: token1Out, fee: sell.fee, sqrtPriceLimitX96: 0
         }), `quote-sell ${_pair.label}`)
+        if (token0Back <= 0n) return null
+        dbg(`roundtrip ${buy.dexId}:${buy.fee}->${sell.dexId}:${sell.fee}`,
+          `in=${fmt(flashAmount, token0)} ${token0.symbol}`,
+          `mid=${fmt(token1Out, token1)} ${token1.symbol}`,
+          `out=${fmt(token0Back, token0)} ${token0.symbol}`,
+          `profit=${fmt(token0Back - flashAmount, token0)} ${token0.symbol}`)
         return token0Back - flashAmount
       } catch (err) {
         return null // size not quotable (exceeds liquidity, etc.)
