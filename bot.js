@@ -711,12 +711,30 @@ const determineProfitability = async (_exchangePath, _pair) => {
 
     const evaluate = async (amount) => ({ amount, profit: await roundTripProfit(amount) })
 
-    // --- 3. Find the profit-maximising size ---
-    // Coarse geometric grid from maxFlash / 2^SEARCH_STEPS up to maxFlash
-    const grid = []
+    // --- 3. Find the profit-maximising size over the feasible range ----------
+    // Feasible range is (0, maxFlash], where maxFlash = MAX_POOL_FRACTION of the
+    // buy pool's token0 — a deliberate slippage/risk cap, not an optimizer limit.
+    // Profit vs. size is a single hump (too small earns nothing; too big lets
+    // slippage eat the spread), so a coarse geometric grid locates the hump and a
+    // ternary search refines the peak. We maximise GROSS round-trip profit;
+    // because gas is essentially independent of trade size, argmax(gross) ==
+    // argmax(gross - gas) == argmax(net), so this also maximises net-of-gas profit.
+
+    // Coarse geometric grid up to maxFlash. De-duplicate and drop non-positive
+    // sizes: for small pools the high-order right-shifts collapse to 0/duplicates,
+    // which waste quotes and would break the neighbour bracketing below. Keeping
+    // the grid a clean ascending set makes the bracketing exact.
+    const gridSet = new Set()
     for (let i = SEARCH_STEPS; i >= 0; i--) {
-      grid.push(maxFlash >> BigInt(i))
+      const size = maxFlash >> BigInt(i)
+      if (size > 0n) gridSet.add(size)
     }
+    const grid = [...gridSet].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+
+    if (grid.length === 0) {
+      throw new Error("Buy pool token0 liquidity too small to size a trade")
+    }
+
     const coarse = (await Promise.all(grid.map(evaluate))).filter(r => r.profit !== null)
 
     if (coarse.length === 0) {
@@ -725,13 +743,16 @@ const determineProfitability = async (_exchangePath, _pair) => {
 
     let best = coarse.reduce((a, b) => (b.profit > a.profit ? b : a))
 
-    // Ternary refinement between the grid neighbours of the best point
-    const bestIdx = grid.findIndex(a => a === best.amount)
+    // Ternary refinement within the grid neighbours that bracket the peak. For a
+    // unimodal profit curve the continuous optimum lies between the best grid
+    // point's neighbours, so this converges on the true maximum.
+    const bestIdx = grid.findIndex((a) => a === best.amount)
     let lo = grid[Math.max(0, bestIdx - 1)]
     let hi = grid[Math.min(grid.length - 1, bestIdx + 1)]
-    for (let i = 0; i < REFINE_ITERS && hi > lo; i++) {
-      const m1 = lo + (hi - lo) / 3n
-      const m2 = hi - (hi - lo) / 3n
+    for (let i = 0; i < REFINE_ITERS && hi - lo > 1n; i++) {
+      const third = (hi - lo) / 3n
+      const m1 = lo + third
+      const m2 = hi - third
       const [r1, r2] = await Promise.all([evaluate(m1), evaluate(m2)])
       const p1 = r1.profit ?? -1n
       const p2 = r2.profit ?? -1n
@@ -748,6 +769,15 @@ const determineProfitability = async (_exchangePath, _pair) => {
     const flashAmount = best.amount
     m.flashAmount = flashAmount
     m.grossProfit = grossProfit
+
+    // Surface when the optimum sits at the top of the feasible range: profit was
+    // still climbing at the MAX_POOL_FRACTION cap, so the cap — not the market —
+    // is the binding constraint and a larger trade could earn more. The operator
+    // can then raise MAX_POOL_FRACTION knowingly (it trades off slippage/risk).
+    m.sizeCapped = flashAmount >= grid[grid.length - 1]
+    if (m.sizeCapped && grossProfit > 0n) {
+      console.log(`Note: optimal size hit the MAX_POOL_FRACTION cap (${MAX_POOL_FRACTION} of buy-pool token0); a larger trade may be more profitable — raise MAX_POOL_FRACTION to capture it (more slippage/risk).\n`)
+    }
 
     // --- 4. Profitability gates ---
     if (grossProfit <= 0n) {
