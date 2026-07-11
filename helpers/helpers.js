@@ -14,6 +14,7 @@ Big.DP = 40
 
 const { IUniswapV3Pool, IPancakeswapV3Pool } = require('./abi')
 const IERC20 = require('@openzeppelin/contracts/build/contracts/ERC20.json')
+const { withRetry } = require('./rpc')
 
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 
@@ -84,10 +85,15 @@ async function mapLimit(_items, _limit, _fn) {
 }
 
 /**
- * Auto-discover every base/quote pair (across the configured fee tiers) that has
- * a live pool on BOTH Uniswap V3 and Pancakeswap V3. Only pairs present on both
- * exchanges are usable for cross-DEX arbitrage. token0 is always a base token
- * (the one we flash-loan and take profit in).
+ * Auto-discover arbitrage-eligible token pairs on Arbitrum. For each base/quote
+ * token pair we probe EVERY configured fee tier on BOTH Uniswap V3 and
+ * Pancakeswap V3 and collect all pools that exist. A pair is eligible when it
+ * has >= 2 pools across DEXes/fee tiers, since that's the minimum needed for a
+ * distinct buy and sell venue (the arbitrage search later forms every ordered
+ * buy/sell combination across these pools, including cross-fee-tier and
+ * cross-DEX routes). token0 is always a base token (the one we flash-loan and
+ * take profit in). Returns, per pair:
+ *   { key, token0, token1, label, pools: [{ dexId, dexName, fee, address }, …] }
  */
 async function discoverPairs(_uniswap, _pancakeswap, _config, _provider) {
   const base = _config.TOKENS.BASE
@@ -102,74 +108,71 @@ async function discoverPairs(_uniswap, _pancakeswap, _config, _provider) {
   const stables = new Set((_config.TOKENS.STABLES || []).map((a) => ethers.getAddress(a)))
   const skipStablePairs = _config.PROJECT_SETTINGS.SKIP_STABLE_PAIRS === true
 
-  // Build the unique set of combos to probe. token0 = base, token1 = any other token.
+  // Unique unordered token pairs (token0 = base, token1 = quote).
   const seen = new Set()
-  const combos = []
-
+  const tokenPairs = []
   for (const baseAddrRaw of Object.values(base)) {
     const baseAddr = ethers.getAddress(baseAddrRaw)
-
     for (const quoteAddrRaw of Object.values(quote)) {
       const quoteAddr = ethers.getAddress(quoteAddrRaw)
       if (baseAddr === quoteAddr) continue
-
-      // Drop stable<->stable combos entirely (both tokens are stablecoins)
       if (skipStablePairs && stables.has(baseAddr) && stables.has(quoteAddr)) continue
-
-      for (const fee of feeTiers) {
-        const key = [baseAddr, quoteAddr].sort().join('-') + '-' + fee
-        if (seen.has(key)) continue
-        seen.add(key)
-        combos.push({ baseAddr, quoteAddr, fee })
-      }
+      const key = [baseAddr, quoteAddr].sort().join('-')
+      if (seen.has(key)) continue
+      seen.add(key)
+      tokenPairs.push({ baseAddr, quoteAddr, key })
     }
   }
 
-  // Probe both factories; keep only pairs with a pool on BOTH exchanges.
-  const probed = await mapLimit(combos, limit, async (combo) => {
+  // One flat probe per (token pair, DEX, fee tier), run at bounded concurrency so
+  // discovery never bursts the RPC. (Total getPool calls are the same as before.)
+  const exchanges = [
+    { id: 'uni', name: _uniswap.name, factory: _uniswap.factory },
+    { id: 'pancake', name: _pancakeswap.name, factory: _pancakeswap.factory }
+  ]
+  const probes = []
+  for (const tp of tokenPairs) {
+    for (const ex of exchanges) {
+      for (const fee of feeTiers) probes.push({ tp, ex, fee })
+    }
+  }
+
+  const results = await mapLimit(probes, limit, async (u) => {
     try {
-      const [uPoolAddress, pPoolAddress] = await Promise.all([
-        _uniswap.factory.getPool(combo.baseAddr, combo.quoteAddr, combo.fee),
-        _pancakeswap.factory.getPool(combo.baseAddr, combo.quoteAddr, combo.fee)
-      ])
-
-      if (uPoolAddress === ZERO_ADDRESS || pPoolAddress === ZERO_ADDRESS) {
-        return null
-      }
-
-      const token0 = await getTokenData(combo.baseAddr, _provider)
-      const token1 = await getTokenData(combo.quoteAddr, _provider)
-
-      // `label` is assigned later by assignDisplayLabels(), once the full set is
-      // known and we can tell which symbols need address disambiguation.
-      return {
-        token0,
-        token1,
-        fee: combo.fee,
-        uPoolAddress,
-        pPoolAddress
-      }
+      // Retry transient 429/socket blips so rate-limiting during the discovery
+      // burst doesn't silently drop real pools (and thus whole pairs).
+      const address = await withRetry(
+        () => u.ex.factory.getPool(u.tp.baseAddr, u.tp.quoteAddr, u.fee),
+        `getPool ${u.ex.id}:${u.fee}`
+      )
+      if (!address || address === ZERO_ADDRESS) return null
+      return { pairKey: u.tp.key, tp: u.tp, dexId: u.ex.id, dexName: u.ex.name, fee: u.fee, address }
     } catch (error) {
-      // Bad address / unresponsive token / non-standard pool — just skip it
+      // Bad address / unresponsive factory — just skip this probe
       return null
     }
   })
 
-  const found = probed.filter(Boolean)
+  // Group discovered pools by token pair.
+  const byPair = new Map()
+  for (const r of results.filter(Boolean)) {
+    if (!byPair.has(r.pairKey)) byPair.set(r.pairKey, { tp: r.tp, pools: [] })
+    byPair.get(r.pairKey).pools.push({ dexId: r.dexId, dexName: r.dexName, fee: r.fee, address: r.address })
+  }
 
-  // Defensive de-duplication by (token0 address, token1 address, fee) — NOT by
-  // symbol. Discovery already probes each unordered pair once, but this
-  // guarantees we never build two entries (and therefore two Swap
-  // subscriptions) for the same pool, regardless of config overlaps. Each
-  // surviving pair gets a stable `key` used downstream as its processing-lock id.
+  // Keep only pairs with >= 2 pools (need a distinct buy and sell venue).
   const uniq = []
-  const seenPools = new Set()
-  for (const p of found) {
-    const key = `${p.token0.address}-${p.token1.address}-${p.fee}`
-    if (seenPools.has(key)) continue
-    seenPools.add(key)
-    p.key = key
-    uniq.push(p)
+  for (const { tp, pools } of byPair.values()) {
+    if (pools.length < 2) continue
+    try {
+      const [token0, token1] = await Promise.all([
+        withRetry(() => getTokenData(tp.baseAddr, _provider), 'token meta'),
+        withRetry(() => getTokenData(tp.quoteAddr, _provider), 'token meta')
+      ])
+      uniq.push({ key: `${token0.address}-${token1.address}`, token0, token1, pools })
+    } catch (error) {
+      // Token metadata unreadable (transient RPC / non-standard token) — skip pair
+    }
   }
 
   // Give each pair a human label, disambiguating shared symbols by address.
@@ -205,7 +208,8 @@ function assignDisplayLabels(pairs) {
   for (const p of pairs) {
     p.token0.displaySymbol = display(p.token0)
     p.token1.displaySymbol = display(p.token1)
-    p.label = `${p.token1.displaySymbol}/${p.token0.displaySymbol} @ ${p.fee}`
+    // No @fee suffix — a pair now spans every fee tier it has a pool on.
+    p.label = `${p.token1.displaySymbol}/${p.token0.displaySymbol}`
   }
 }
 
