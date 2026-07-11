@@ -6,12 +6,33 @@ const ethers = require("ethers")
 const config = require('./config.json')
 const {
   getPoolContractByAddress,
-  getPoolLiquidity,
+  getPoolTokenBalances,
   calculatePrice,
-  discoverPairs
+  discoverPairs,
+  rebindTokenProvider
 } = require('./helpers/helpers')
-const { provider, uniswap, pancakeswap, arbitrage } = require('./helpers/initialization')
+const init = require('./helpers/initialization')
 const logger = require('./helpers/logger')
+const metrics = require('./helpers/metrics')
+const { withRetry } = require('./helpers/rpc')
+
+// Connection objects — (re)assigned by buildConnection() at startup and on every
+// websocket reconnect. Declared with `let` so every function below closes over
+// these module-level bindings and automatically uses the current instances.
+let provider, uniswap, pancakeswap, arbitrage
+
+// -- SAFETY NET --
+// A 24/7 monitor must never die on a stray async error. Per-event errors are
+// already caught in eventHandler; these guards catch anything that slips past
+// (e.g. a rejection from a detached provider callback) and keep the process up.
+process.on('unhandledRejection', (reason) => {
+  const msg = reason && reason.message ? reason.message : String(reason)
+  console.error(`Unhandled rejection (ignored, monitor continues): ${msg}`)
+})
+process.on('uncaughtException', (err) => {
+  const msg = err && err.message ? err.message : String(err)
+  console.error(`Uncaught exception (ignored, monitor continues): ${msg}`)
+})
 
 // -- MODE -----------------------------------------------------------------
 // The bot runs in one of two fully independent modes, selected in config.json:
@@ -35,6 +56,11 @@ const IS_EXECUTION_MODE = config.PROJECT_SETTINGS.isDeployed === true
 // The signer is only needed to estimate/send transactions, so it exists in
 // execution mode only. It is created once, up front, in assertExecutionReady().
 let account = null
+
+// Latest block height, kept fresh by a single provider 'block' subscription so
+// we never call getBlockNumber() per swap event (see main()). Updated on
+// reconnect too.
+let latestBlock = 0
 
 // -- CONFIGURATION VALUES HERE -- //
 const UNITS = config.PROJECT_SETTINGS.PRICE_UNITS
@@ -120,34 +146,151 @@ const buildExecutedRecord = async (_pair, priceInfo, metrics, exec) => {
   }
 }
 
-// Global lock so we only ever work a single opportunity at a time (avoids nonce
-// collisions and overlapping trades when many pools fire events at once).
-let isExecuting = false
+// -- CONCURRENCY --
+// Per-pool processing lock: while a pool is being evaluated, additional Swap
+// events for THAT SAME pool are ignored (a single block can emit many). Keyed
+// by pair.key = (token0, token1, fee). Different pools still evaluate
+// concurrently, so a slow evaluation on one pair no longer blocks the others.
+const processing = new Set()
+
+// Global execution mutex: at most ONE trade may be in flight at a time, so
+// nonces never collide even though evaluations run concurrently. This preserves
+// the original "single trade at a time" behavior (execution mode only).
+let tradeInFlight = false
 
 /**
- * EXECUTION MODE precondition check. Fails fast (before any pools are watched)
- * with an actionable message if the config asks us to trade but isn't set up to,
- * and creates the shared signer. Never called in monitor mode.
+ * EXECUTION MODE precondition check. Fails fast (before we even connect) with an
+ * actionable message if the config asks us to trade but isn't set up to. Never
+ * called in monitor mode. The signer/contract themselves are built in
+ * buildConnection().
  */
 const assertExecutionReady = () => {
-  if (!arbitrage) {
+  const addr = config.PROJECT_SETTINGS.ARBITRAGE_ADDRESS
+  if (!addr || !ethers.isAddress(addr)) {
     throw new Error(
-      "Execution mode (isDeployed=true) requires a deployed Arbitrage contract, but none was " +
-      "initialized. Set a valid ARBITRAGE_ADDRESS in config.json (and deploy the contract), " +
-      "or set isDeployed=false to run in monitor-only mode."
+      "Execution mode (isDeployed=true) requires a valid ARBITRAGE_ADDRESS in config.json " +
+      "(deploy the contract first), or set isDeployed=false to run in monitor-only mode."
     )
   }
   if (!process.env.PRIVATE_KEY) {
     throw new Error("Execution mode requires PRIVATE_KEY in .env to sign transactions.")
   }
-  account = new ethers.Wallet(process.env.PRIVATE_KEY, provider)
+}
+
+// -- CONNECTION LIFECYCLE (auto-reconnect) --------------------------------
+// Discovered pair DATA (token metadata + resolved pool addresses) persists
+// across reconnects — only the provider-bound contract objects go stale — so a
+// reconnect never re-runs discovery.
+let discoveredPairs = []   // immutable pair descriptors from discoverPairs()
+let watchedPairs = []      // live pair objects with current pool contracts
+let reconnecting = false
+const RECONNECT_BACKOFF_MS = [1000, 2000, 5000, 10000] // caps at the last value
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/**
+ * (Re)build the whole connection: a fresh provider, the DEX + Arbitrage
+ * contracts and signer bound to it, the block-height subscription, and the
+ * socket-close handler that triggers reconnect.
+ */
+const buildConnection = () => {
+  provider = init.createProvider()
+  ;({ uniswap, pancakeswap } = init.createExchanges(provider))
+  arbitrage = IS_EXECUTION_MODE ? init.createArbitrage(provider) : null
+  account = IS_EXECUTION_MODE ? new ethers.Wallet(process.env.PRIVATE_KEY, provider) : null
+
+  // Cache the latest block height from a single push subscription (no
+  // getBlockNumber() per swap).
+  provider.on('block', (n) => { latestBlock = n })
+
+  attachDisconnectHandler()
+}
+
+// Rebuild pool contracts for every discovered pair against the CURRENT provider
+// and subscribe to both sides' Swap events. Old listeners are torn down first so
+// a reconnect never leaves duplicate subscriptions behind.
+const subscribeAll = () => {
+  for (const p of watchedPairs) {
+    try { p.uPool.removeAllListeners(); p.pPool.removeAllListeners() } catch (e) { /* dead socket */ }
+  }
+
+  watchedPairs = discoveredPairs.map((p) => {
+    const uPool = getPoolContractByAddress(uniswap, p.uPoolAddress, provider)
+    const pPool = getPoolContractByAddress(pancakeswap, p.pPoolAddress, provider)
+    const pair = {
+      key: p.key, // stable (addr,addr,fee) id used by the per-pool processing lock
+      label: p.label,
+      token0: p.token0,
+      token1: p.token1,
+      fee: p.fee,
+      uPool,
+      pPool
+    }
+    uPool.on('Swap', () => eventHandler(pair))
+    pPool.on('Swap', () => eventHandler(pair))
+    return pair
+  })
+}
+
+// Hook the underlying websocket's close/error so a dropped connection triggers
+// an automatic reconnect. ethers v6 leaves onclose/onerror unset, so this is safe.
+const attachDisconnectHandler = () => {
+  try {
+    const ws = provider.websocket
+    ws.onclose = () => { console.error('\nWebSocket closed.'); scheduleReconnect() }
+    ws.onerror = (e) => { console.error(`\nWebSocket error: ${(e && e.message) || ''}`); scheduleReconnect() }
+  } catch (e) {
+    // websocket not available yet — the next error will re-trigger reconnect
+  }
+}
+
+/**
+ * Automatically reconnect after a websocket drop: tear down the dead
+ * connection, then retry (with backoff) rebuilding the provider, contracts,
+ * token contracts and Swap subscriptions until we're live again. No discovery,
+ * no manual restart. Guarded so overlapping close/error events reconnect once.
+ */
+const scheduleReconnect = async () => {
+  if (reconnecting) return
+  reconnecting = true
+  metrics.incr('wsReconnects')
+
+  // Best-effort teardown of the dead connection and its stale, provider-bound caches.
+  try { provider.websocket.onclose = null; provider.websocket.onerror = null } catch (e) { /* noop */ }
+  try { for (const p of watchedPairs) { p.uPool.removeAllListeners(); p.pPool.removeAllListeners() } } catch (e) { /* noop */ }
+  try { await provider.destroy() } catch (e) { /* noop */ }
+  _gasPoolCache.clear()   // held quoter refs bound to the dead provider
+  _usdcPoolCache.clear()
+
+  for (let attempt = 0; ; attempt++) {
+    const delay = RECONNECT_BACKOFF_MS[Math.min(attempt, RECONNECT_BACKOFF_MS.length - 1)]
+    console.log(`Reconnecting in ${delay}ms (attempt ${attempt + 1})...`)
+    await sleep(delay)
+    try {
+      buildConnection()
+      rebindTokenProvider(provider)               // refresh cached token contracts
+      latestBlock = await provider.getBlockNumber()
+      subscribeAll()
+      console.log(`Reconnected. Monitoring ${watchedPairs.length} pair(s).\n`)
+      reconnecting = false
+      return
+    } catch (err) {
+      console.error(`Reconnect attempt ${attempt + 1} failed: ${err.message || err}`)
+      try { await provider.destroy() } catch (e) { /* noop */ }
+    }
+  }
 }
 
 const main = async () => {
+  metrics.markStart() // uptime counts from here, not module-load time
+
   // -- STARTUP: announce mode & network, and validate execution prerequisites --
   const network = config.PROJECT_SETTINGS.isLocal ? 'local Hardhat fork' : 'Arbitrum One'
+  if (IS_EXECUTION_MODE) assertExecutionReady()
+
+  buildConnection() // provider + contracts + signer + block sub + reconnect handler
+
   if (IS_EXECUTION_MODE) {
-    assertExecutionReady()
     console.log(`Mode: EXECUTION — profitable opportunities WILL be traded.`)
     console.log(`  Contract: ${config.PROJECT_SETTINGS.ARBITRAGE_ADDRESS}`)
     console.log(`  Signer:   ${account.address}`)
@@ -157,77 +300,112 @@ const main = async () => {
   }
   console.log(`Network: ${network}\n`)
 
+  latestBlock = await provider.getBlockNumber()
+
   console.log(`Discovering pairs available on BOTH Uniswap V3 & Pancakeswap V3...\n`)
 
-  const discovered = await discoverPairs(uniswap, pancakeswap, config, provider)
+  discoveredPairs = await discoverPairs(uniswap, pancakeswap, config, provider)
 
-  if (discovered.length === 0) {
+  if (discoveredPairs.length === 0) {
     console.log(`No overlapping pairs found. Check your token list / network in config.json.\n`)
     return
   }
 
-  console.log(`Found ${discovered.length} arbitrage-eligible pair(s):`)
-  for (const p of discovered) {
+  console.log(`Found ${discoveredPairs.length} arbitrage-eligible pair(s):`)
+  for (const p of discoveredPairs) {
     console.log(`  - ${p.label}`)
   }
   console.log("")
 
-  // Build pool contracts for each discovered pair and subscribe to swaps on both sides
-  for (const p of discovered) {
-    const uPool = getPoolContractByAddress(uniswap, p.uPoolAddress, provider)
-    const pPool = getPoolContractByAddress(pancakeswap, p.pPoolAddress, provider)
+  subscribeAll()
 
-    const pair = {
-      label: p.label,
-      token0: p.token0,
-      token1: p.token1,
-      fee: p.fee,
-      uPool,
-      pPool
-    }
+  console.log(`Monitoring ${watchedPairs.length} pair(s). Waiting for swap event...\n`)
+}
 
-    uPool.on('Swap', () => eventHandler(pair))
-    pPool.on('Swap', () => eventHandler(pair))
+/**
+ * Print a clear, structured reason for every rejection — never just
+ * "No Arbitrage Available". Shows spread vs. minimum for below-threshold
+ * spreads, and the gross/gas/net breakdown when a full round-trip was priced.
+ */
+const logRejection = (_pair, { spreadPct, reason, metrics: m }) => {
+  console.log(`Rejected — ${_pair.label}`)
+  if (spreadPct !== undefined) {
+    console.log(`  Spread:   ${spreadPct.toFixed(2)}%`)
+    console.log(`  Minimum:  ${Number(PRICE_DIFFERENCE).toFixed(2)}%`)
   }
-
-  console.log(`Monitoring ${discovered.length} pair(s). Waiting for swap event...\n`)
+  const t0 = _pair.token0
+  if (m && m.grossProfit !== undefined) {
+    console.log(`  Gross:    ${fmt(m.grossProfit, t0)} ${t0.symbol}`)
+    if (m.gasCostBase !== undefined && m.gasCostBase !== null) {
+      console.log(`  Gas:      ${fmt(m.gasCostBase, t0)} ${t0.symbol}`)
+    }
+    if (m.netProfit !== undefined && m.netProfit !== null) {
+      console.log(`  Net:      ${fmt(m.netProfit, t0)} ${t0.symbol}`)
+    }
+  }
+  console.log(`  Reason:   ${reason || 'Not profitable'}`)
+  console.log(`-----------------------------------------\n`)
 }
 
 const eventHandler = async (_pair) => {
-  if (isExecuting) return
-  isExecuting = true
+  metrics.incr('swapsReceived')
 
+  // Ignore overlapping/duplicate events for the SAME pool while it's in flight.
+  if (processing.has(_pair.key)) return
+  processing.add(_pair.key)
+
+  const startedAt = Date.now()
   try {
+    metrics.incr('swapsEvaluated')
+
     const priceInfo = await checkPrice(_pair)
     const exchangePath = await determineDirection(priceInfo.priceDifference)
 
     if (!exchangePath) {
-      // Spread below threshold — the common case; not logged, to keep the record clean
-      console.log(`No Arbitrage Currently Available on ${_pair.label}\n`)
-      console.log(`-----------------------------------------\n`)
+      // Spread below threshold — the common case.
+      logRejection(_pair, {
+        spreadPct: Math.abs(Number(priceInfo.priceDifference)),
+        reason: 'Spread below threshold'
+      })
       return
     }
 
-    const { isProfitable, amount, metrics, reason } = await determineProfitability(exchangePath, _pair)
+    metrics.incr('opportunitiesFound')
+
+    const { isProfitable, amount, metrics: oppMetrics, reason } = await determineProfitability(exchangePath, _pair)
 
     if (!isProfitable) {
-      logger.recordOutcome(buildRecord('rejected', _pair, priceInfo, metrics, { reason }))
-      console.log(`No Arbitrage Currently Available on ${_pair.label}\n`)
-      console.log(`-----------------------------------------\n`)
+      metrics.incr('tradesRejected')
+      logger.recordOutcome(buildRecord('rejected', _pair, priceInfo, oppMetrics, { reason }))
+      logRejection(_pair, { reason, metrics: oppMetrics })
       return
     }
+
+    metrics.incr('profitableOpportunities')
 
     if (!IS_EXECUTION_MODE) {
       // Monitor-only mode: record the detected opportunity but don't trade
-      logger.recordOutcome(buildRecord('detected', _pair, priceInfo, metrics, {}))
-      console.log(`Profitable opportunity detected on ${_pair.label} (monitor mode; set isDeployed=true to trade)\n`)
+      logger.recordOutcome(buildRecord('detected', _pair, priceInfo, oppMetrics, {}))
+      console.log(`Profitable opportunity DETECTED on ${_pair.label} (monitor mode; set isDeployed=true to trade)\n`)
       console.log(`-----------------------------------------\n`)
       return
     }
 
-    const exec = await executeTrade(exchangePath, _pair, amount)
-    logger.recordOutcome(await buildExecutedRecord(_pair, priceInfo, metrics, exec))
-    console.log(`Trade logged${exec.txHash ? ` (tx ${exec.txHash})` : ''}\n`)
+    // Execution mode: serialize the actual send. If a trade is already in
+    // flight, skip this one — the next swap on this pair will re-trigger us.
+    if (tradeInFlight) {
+      console.log(`Skipping ${_pair.label}: another trade is already in flight.\n`)
+      return
+    }
+    tradeInFlight = true
+    try {
+      const exec = await executeTrade(exchangePath, _pair, amount)
+      metrics.incr('tradesExecuted')
+      logger.recordOutcome(await buildExecutedRecord(_pair, priceInfo, oppMetrics, exec))
+      console.log(`Trade logged${exec.txHash ? ` (tx ${exec.txHash})` : ''}\n`)
+    } finally {
+      tradeInFlight = false
+    }
   } catch (error) {
     console.log(error)
     logger.recordOutcome({
@@ -235,7 +413,8 @@ const eventHandler = async (_pair) => {
       reason: error.message || String(error)
     })
   } finally {
-    isExecuting = false
+    processing.delete(_pair.key)
+    metrics.recordEvalTime(Date.now() - startedAt)
     console.log("\nWaiting for swap event...\n")
   }
 }
@@ -243,10 +422,11 @@ const eventHandler = async (_pair) => {
 const checkPrice = async (_pair) => {
   console.log(`Swap Detected on ${_pair.label}, Checking Price...\n`)
 
-  const currentBlock = await provider.getBlockNumber()
+  // Cached from the 'block' subscription — no getBlockNumber() RPC per swap
+  const currentBlock = latestBlock
 
-  const uPrice = await calculatePrice(_pair.uPool, _pair.token0, _pair.token1)
-  const pPrice = await calculatePrice(_pair.pPool, _pair.token0, _pair.token1)
+  const uPrice = await withRetry(() => calculatePrice(_pair.uPool, _pair.token0, _pair.token1), `price ${_pair.label} (uni)`)
+  const pPrice = await withRetry(() => calculatePrice(_pair.pPool, _pair.token0, _pair.token1), `price ${_pair.label} (pancake)`)
 
   // Compute the % difference from the RAW prices (rounding to PRICE_UNITS first would
   // collapse sub-1 prices to 0 and yield NaN for stablecoin-decimal pairs).
@@ -386,11 +566,10 @@ const valueInUsdc = async (amountRaw, token) => {
 // The contract's executeTrade takes the two router addresses and the two-token
 // path. Both determineProfitability (gas estimate) and executeTrade need these,
 // so build them in one place. exchangePath[0] is the buy DEX, [1] is the sell DEX.
-const buildTradePaths = async (_exchangePath, _pair) => ({
-  routerPath: [
-    await _exchangePath[0].router.getAddress(),
-    await _exchangePath[1].router.getAddress()
-  ],
+// exchange.routerAddress is cached from config at startup, so this needs no RPC
+// and no contract.getAddress() round-trip. exchangePath[0]=buy, [1]=sell.
+const buildTradePaths = (_exchangePath, _pair) => ({
+  routerPath: [_exchangePath[0].routerAddress, _exchangePath[1].routerAddress],
   tokenPath: [_pair.token0.address, _pair.token1.address]
 })
 
@@ -403,11 +582,13 @@ const buildTradePaths = async (_exchangePath, _pair) => ({
 const estimateTradeGas = async (_exchangePath, _pair, _flashAmount) => {
   const { routerPath, tokenPath } = await buildTradePaths(_exchangePath, _pair)
   try {
-    const gasUnits = await arbitrage
-      .connect(account)
-      .executeTrade
-      .estimateGas(routerPath, tokenPath, _pair.fee, _flashAmount)
-    const feeData = await provider.getFeeData()
+    // A genuine revert (loan can't repay) is permanent and rethrown at once;
+    // only 429/socket blips are retried.
+    const gasUnits = await withRetry(
+      () => arbitrage.connect(account).executeTrade.estimateGas(routerPath, tokenPath, _pair.fee, _flashAmount),
+      `estimateGas ${_pair.label}`
+    )
+    const feeData = await withRetry(() => provider.getFeeData(), 'getFeeData')
     const gasPrice = feeData.gasPrice ?? feeData.maxFeePerGas ?? 0n
     return gasUnits * gasPrice
   } catch (err) {
@@ -464,7 +645,13 @@ const determineProfitability = async (_exchangePath, _pair) => {
 
   try {
     // --- 1. Bound the trade size by the buy pool's token0 reserves ---
-    const [buyToken0Reserve] = await getPoolLiquidity(buy.factory, token0, token1, fee, provider)
+    // Use the pool address resolved at discovery time (buy is one of the two
+    // exchange objects); avoids a redundant factory.getPool() RPC per evaluation.
+    const buyPool = buy.name === uniswap.name ? _pair.uPool : _pair.pPool
+    const [buyToken0Reserve] = await withRetry(
+      () => getPoolTokenBalances(buyPool.target, token0, token1),
+      `reserves ${_pair.label}`
+    )
 
     if (buyToken0Reserve === 0n) {
       throw new Error("Buy pool has no token0 liquidity")
@@ -478,12 +665,14 @@ const determineProfitability = async (_exchangePath, _pair) => {
     const roundTripProfit = async (flashAmount) => {
       if (flashAmount <= 0n) return null
       try {
-        const [token1Out] = await buy.quoter.quoteExactInputSingle.staticCall({
+        // Retry transient 429/socket blips per quote; a real "unquotable size"
+        // revert is permanent and falls through to the null return below.
+        const [token1Out] = await withRetry(() => buy.quoter.quoteExactInputSingle.staticCall({
           tokenIn: token0.address, tokenOut: token1.address, amountIn: flashAmount, fee, sqrtPriceLimitX96: 0
-        })
-        const [token0Back] = await sell.quoter.quoteExactInputSingle.staticCall({
+        }), `quote-buy ${_pair.label}`)
+        const [token0Back] = await withRetry(() => sell.quoter.quoteExactInputSingle.staticCall({
           tokenIn: token1.address, tokenOut: token0.address, amountIn: token1Out, fee, sqrtPriceLimitX96: 0
-        })
+        }), `quote-sell ${_pair.label}`)
         return token0Back - flashAmount
       } catch (err) {
         // Size not quotable (e.g. exceeds available liquidity) — unusable
@@ -582,9 +771,8 @@ const determineProfitability = async (_exchangePath, _pair) => {
     return { isProfitable: true, amount: flashAmount, metrics: m }
 
   } catch (error) {
+    // The caller (eventHandler) prints a structured rejection via logRejection().
     const reason = error.message || String(error)
-    console.log(`Not profitable: ${reason}`)
-    console.log("")
     return { isProfitable: false, amount: 0, metrics: m, reason }
   }
 }

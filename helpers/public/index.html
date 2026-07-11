@@ -58,11 +58,14 @@
   .grid { display: grid; gap: 14px; }
   .kpis { grid-template-columns: repeat(4, 1fr); margin-bottom: 14px; }
   .funnel { grid-template-columns: repeat(3, 1fr); margin-bottom: 22px; }
+  .runtime { grid-template-columns: repeat(4, 1fr); margin-bottom: 22px; }
   .charts { grid-template-columns: 1fr 1fr; margin-bottom: 22px; }
   @media (max-width: 820px) {
     .kpis { grid-template-columns: repeat(2, 1fr); }
+    .runtime { grid-template-columns: repeat(2, 1fr); }
     .charts { grid-template-columns: 1fr; }
   }
+  .section-title { font-size: 13px; font-weight: 600; margin: 4px 0 12px; color: var(--text-2); }
 
   .card {
     background: var(--surface-1); border: 1px solid var(--border);
@@ -114,6 +117,9 @@
   <div class="grid kpis" id="kpis"></div>
   <div class="grid funnel" id="funnelRow"></div>
 
+  <div class="section-title">Runtime health (this process)</div>
+  <div class="grid runtime" id="runtimeRow"></div>
+
   <div class="grid charts">
     <div class="card">
       <h2>Cumulative net profit (USD)</h2>
@@ -157,6 +163,36 @@ function renderFunnel(s) {
     tile('Opportunities detected', (s.totals.detected + s.totals.executed).toLocaleString()) +
     tile('Rejected (unprofitable)', s.totals.rejected.toLocaleString()) +
     tile('Executed', s.totals.executed.toLocaleString())
+}
+
+// ---- Live runtime metrics (from /api/stats -> runtime) ----
+function fmtUptime(sec) {
+  sec = Math.max(0, Math.floor(Number(sec) || 0))
+  const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600)
+  const m = Math.floor((sec % 3600) / 60), s = sec % 60
+  if (d) return `${d}d ${h}h ${m}m`
+  if (h) return `${h}h ${m}m ${s}s`
+  if (m) return `${m}m ${s}s`
+  return `${s}s`
+}
+function metricTile(label, value) {
+  return `<div class="card tile"><div class="label">${label}</div><div class="value small">${value}</div></div>`
+}
+function renderRuntime(r) {
+  if (!r) { $('runtimeRow').innerHTML = ''; return }
+  const n = (v) => (Number(v) || 0).toLocaleString()
+  $('runtimeRow').innerHTML =
+    metricTile('Uptime', fmtUptime(r.uptimeSeconds)) +
+    metricTile('Swaps received', n(r.swapsReceived)) +
+    metricTile('Swaps evaluated', n(r.swapsEvaluated)) +
+    metricTile('Opportunities found', n(r.opportunitiesFound)) +
+    metricTile('Profitable', n(r.profitableOpportunities)) +
+    metricTile('Trades executed', n(r.tradesExecuted)) +
+    metricTile('Trades rejected', n(r.tradesRejected)) +
+    metricTile('Avg eval time', (Number(r.avgEvalTimeMs) || 0) + ' ms') +
+    metricTile('RPC requests', n(r.rpcRequests)) +
+    metricTile('RPC retries', n(r.rpcRetries)) +
+    metricTile('WS reconnects', n(r.wsReconnects))
 }
 
 // ---- Cumulative net profit line chart (single series) ----
@@ -263,6 +299,7 @@ async function load() {
 
     renderKPIs(stats)
     renderFunnel(stats)
+    renderRuntime(stats.runtime)
     renderLine(stats.daily)
     renderBars(stats.perPair)
     renderTable(trades, m)
