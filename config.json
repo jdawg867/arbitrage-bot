@@ -1,7 +1,7 @@
 {
     "PROJECT_SETTINGS": {
-        "isLocal": true,
-        "isDeployed": true,
+        "isLocal": false,
+        "isDeployed": false,
         "ARBITRAGE_ADDRESS": "0x21dd08c28e8699dc613ACaF6978eD688Cc17aabF",
         "PRICE_UNITS": 0,
         "PRICE_DIFFERENCE": 0.5,
