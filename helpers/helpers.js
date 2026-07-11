@@ -143,7 +143,8 @@ async function discoverPairs(_uniswap, _pancakeswap, _config, _provider) {
       // burst doesn't silently drop real pools (and thus whole pairs).
       const address = await withRetry(
         () => u.ex.factory.getPool(u.tp.baseAddr, u.tp.quoteAddr, u.fee),
-        `getPool ${u.ex.id}:${u.fee}`
+        `getPool ${u.ex.id}:${u.fee}`,
+        { retryEmptyData: true } // getPool must return data; empty = rate-limited
       )
       if (!address || address === ZERO_ADDRESS) return null
       return { pairKey: u.tp.key, tp: u.tp, dexId: u.ex.id, dexName: u.ex.name, fee: u.fee, address }
@@ -166,8 +167,8 @@ async function discoverPairs(_uniswap, _pancakeswap, _config, _provider) {
     if (pools.length < 2) continue
     try {
       const [token0, token1] = await Promise.all([
-        withRetry(() => getTokenData(tp.baseAddr, _provider), 'token meta'),
-        withRetry(() => getTokenData(tp.quoteAddr, _provider), 'token meta')
+        withRetry(() => getTokenData(tp.baseAddr, _provider), 'token meta', { retryEmptyData: true }),
+        withRetry(() => getTokenData(tp.quoteAddr, _provider), 'token meta', { retryEmptyData: true })
       ])
       uniq.push({ key: `${token0.address}-${token1.address}`, token0, token1, pools })
     } catch (error) {

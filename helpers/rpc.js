@@ -37,21 +37,37 @@ function isTransient(err) {
   )
 }
 
+// A CALL_EXCEPTION with empty return data ("missing revert data"): under load
+// Alchemy answers an eth_call with 0x, which ethers surfaces this way. For calls
+// that MUST return data (factory.getPool, ERC20 symbol/decimals) this is a
+// rate-limit symptom, not a real revert — so it's worth retrying. It is NOT
+// retried by default, because a genuine quoter/trade revert can look the same
+// and the hot path must fail fast; callers opt in via { retryEmptyData: true }.
+function isEmptyData(err) {
+  const msg = ((err && (err.shortMessage || err.message)) || String(err)).toLowerCase()
+  return err?.code === 'BAD_DATA' ||
+    msg.includes('missing revert data') ||
+    msg.includes('could not decode result data')
+}
+
 /**
  * Run an async RPC operation with transient-failure retries.
  * @param {() => Promise<any>} fn    the RPC operation
  * @param {string} label             short label for the retry log line
+ * @param {{retryEmptyData?: boolean}} opts  retryEmptyData: also retry empty-data
+ *        CALL_EXCEPTIONs (use for reads that must return data, e.g. discovery)
  * @returns whatever fn resolves to
  * @throws  the last error if it's permanent, or after backoff is exhausted
  */
-async function withRetry(fn, label = 'rpc') {
+async function withRetry(fn, label = 'rpc', opts = {}) {
   for (let attempt = 0; ; attempt++) {
     try {
       return await fn()
     } catch (err) {
+      const retryable = isTransient(err) || (opts.retryEmptyData === true && isEmptyData(err))
       // Permanent error (e.g. a revert) or out of retries → propagate so the
       // caller abandons just this event.
-      if (!isTransient(err) || attempt >= BACKOFF_MS.length) throw err
+      if (!retryable || attempt >= BACKOFF_MS.length) throw err
       metrics.incr('rpcRetries')
       const delay = BACKOFF_MS[attempt]
       console.log(`Transient RPC error on ${label} (attempt ${attempt + 1}): ${err.shortMessage || err.message} — retrying in ${delay}ms`)
@@ -60,4 +76,4 @@ async function withRetry(fn, label = 'rpc') {
   }
 }
 
-module.exports = { withRetry, isTransient }
+module.exports = { withRetry, isTransient, isEmptyData }
