@@ -25,40 +25,47 @@ price discrepancies, and (when a profitable opportunity appears) executes a
 
 ## How it works
 
-The bot is composed of a discovery step plus five core functions in `bot.js`:
+The bot is composed of a discovery step plus the per-swap evaluation in `bot.js`:
 
-- **`discoverPairs()`** (in `helpers/helpers.js`) — on startup, generates every
-  `base × quote × fee-tier` combination from `config.json`, queries both DEX
-  factories, and keeps only the pairs that have a live pool on **both** exchanges.
-  Only those pairs are arbitrage-eligible.
-- **`main()`** — subscribes to `Swap` events on every discovered pool (both DEXs).
-- **`checkPrice()`** — on a swap, logs both DEX prices and returns the % difference.
-- **`determineDirection()`** — decides which DEX to buy on and which to sell on,
-  based on `PRICE_DIFFERENCE`.
-- **`determineProfitability()`** — the trading strategy (see below). Returns
-  `{ isProfitable, amount }`, where `amount` is the token0 flash-loan size.
-- **`executeTrade()`** — calls the deployed `Arbitrage` contract, which takes the
-  Balancer flash loan, performs both swaps, repays the loan, and sends profit to the owner.
+- **`discoverPairs()`** (in `helpers/helpers.js`) — on startup, for every base/quote
+  token pair it probes **every fee tier on both** Uniswap V3 and Pancakeswap V3 and
+  collects **all** pools that exist. A pair is eligible when it has **≥ 2 pools**
+  (a distinct buy and sell venue), and it carries the full pool list.
+- **`main()` / `subscribeAll()`** — subscribes to `Swap` on **every** pool of every
+  pair; any swap re-evaluates the whole pair.
+- **`eventHandler()`** — the search: spot-prices all of the pair's pools, forms every
+  ordered **buy/sell combination across DEXes and fee tiers**, prunes to the routes
+  whose spread clears their fee floor, size-searches the top ones, ranks by net
+  profit, and picks the best.
+- **`executeTrade()`** — calls the deployed `Arbitrage` contract with the winning
+  route's **per-leg fee tiers**; it takes the Balancer flash loan, performs both swaps,
+  repays the loan, and sends profit to the owner.
 
-A global lock (`isExecuting`) ensures only one opportunity is worked at a time, which
-keeps nonces sane and is friendly to a modest VPS.
+A per-pair lock (plus once-per-block dedup) means each pair is worked once per block,
+while different pairs evaluate concurrently; a global mutex still serializes actual
+trades so nonces stay sane.
 
-### The strategy (`determineProfitability`)
+### The strategy (per swap)
 
-For each opportunity the bot:
-
-1. **Bounds the size** — caps any trade at `MAX_POOL_FRACTION` of the buy pool's token0
+1. **Prices all pools & forms routes** — spot-prices every pool of the pair, then builds
+   every ordered `(buy, sell)` pool combination — including **cross-fee-tier and
+   cross-DEX** routes (e.g. buy on Uni 100, sell on Pancake 500).
+2. **Prunes obviously-unprofitable routes** — keeps only routes whose spot spread clears
+   that route's round-trip DEX fee (`buyFee + sellFee`) plus a safety margin, floored at
+   `PRICE_DIFFERENCE`. Low-liquidity/zero-spread combos are dropped before any quoting.
+3. **Bounds the size** — caps any trade at `MAX_POOL_FRACTION` of the buy pool's token0
    reserves so it never tries to swallow the whole pool.
-2. **Quotes what the contract actually does** — two `exactInput` swaps
-   (`token0 → token1` on the buy DEX, `token1 → token0` on the sell DEX). DEX fees are
-   already reflected in the quotes, and Balancer flash loans are free, so the only
-   remaining cost is gas.
-3. **Searches for the profit-maximising size** — profit vs. size is a hump (too small
+4. **Quotes what the contract actually does** — two `exactInput` swaps, each at **its own
+   pool's fee tier** (`token0 → token1` on the buy pool, `token1 → token0` on the sell
+   pool). DEX fees + slippage are reflected in the quotes, and Balancer flash loans are
+   free, so the only remaining cost is gas.
+5. **Searches for the profit-maximising size** — profit vs. size is a hump (too small
    earns nothing, too big lets slippage eat the spread). A coarse geometric grid
    (`SEARCH_STEPS`) finds the region, then a ternary refinement (`REFINE_ITERS`) hones in.
-4. **Gates the trade (gross)** — rejects unless gross profit clears `MIN_PROFIT_BPS`
+   The top `MAX_COMBOS_EVALUATED` routes are searched and **ranked by profit**.
+6. **Gates the trade (gross)** — rejects unless gross profit clears `MIN_PROFIT_BPS`
    (basis points of the flash amount). This gate runs in **both** modes.
-5. **Gates the trade (net) & confirms executability — execution mode only** — when
+7. **Gates the trade (net) & confirms executability — execution mode only** — when
    `isDeployed = true`, the bot additionally runs `estimateGas` on the real
    `executeTrade`, which simulates the whole flash loan and reverts if it wouldn't
    repay; that also gives the real gas cost. Gas is priced in ETH and converted into
