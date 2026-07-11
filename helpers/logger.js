@@ -112,6 +112,8 @@ function computeStats() {
     grossUsd += num(t.grossProfitUsd)
   }
 
+  const routeStats = computeRouteStats(opps)
+
   return {
     generatedAt: new Date().toISOString(),
     totals: {
@@ -132,7 +134,63 @@ function computeStats() {
     daily: Object.entries(daily)
       .map(([date, v]) => ({ date, ...v }))
       .sort((a, b) => a.date.localeCompare(b.date)),
+    // Historical route/pair ranking (from the full opportunity history)
+    routes: routeStats.routes,
+    pairPerformance: routeStats.pairs,
     lastTrade: trades.length ? trades[trades.length - 1] : null
+  }
+}
+
+/**
+ * Aggregate the full opportunity history by ROUTE (pair + buy venue -> sell
+ * venue, each venue = DEX + fee tier) and by PAIR. Read-only over the JSONL logs
+ * — never touches execution. For each, tracks the detection->execution funnel
+ * (opportunities / profitable / executed), realized USD (gross / gas / net),
+ * win rate, and average ROI. Ranked by realized net USD, then by how often the
+ * route produced a profitable opportunity (so routes rank sensibly even before
+ * any executions), so the highest-earning routes surface first.
+ */
+function computeRouteStats(opps) {
+  const routes = new Map()
+  const pairs = new Map()
+
+  const seed = (extra) => ({
+    opportunities: 0, profitable: 0, executed: 0, wins: 0,
+    grossUsd: 0, gasUsd: 0, netUsd: 0, roiSum: 0, roiN: 0, ...extra
+  })
+  const bump = (map, key, extra, o) => {
+    const r = map.get(key) || seed(extra)
+    r.opportunities += 1
+    if (o.status === 'detected' || o.status === 'executed') r.profitable += 1
+    if (o.roiPct !== null && o.roiPct !== undefined) { r.roiSum += num(o.roiPct); r.roiN += 1 }
+    if (o.status === 'executed') {
+      r.executed += 1
+      const net = num(o.netProfitUsd)
+      r.netUsd += net
+      r.grossUsd += num(o.grossProfitUsd)
+      r.gasUsd += num(o.gasCostUsd)
+      if (net > 0) r.wins += 1
+    }
+    map.set(key, r)
+  }
+
+  for (const o of opps) {
+    if (!o.buyOn || !o.sellOn) continue // only records that chose a concrete route
+    bump(routes, `${o.pair} | ${o.buyOn} -> ${o.sellOn}`,
+      { route: `${o.buyOn} -> ${o.sellOn}`, pair: o.pair }, o)
+    bump(pairs, o.pair, { pair: o.pair }, o)
+  }
+
+  const finalize = (map) => [...map.values()].map((r) => ({
+    ...r,
+    avgRoi: r.roiN ? r.roiSum / r.roiN : 0,
+    winRate: r.executed ? r.wins / r.executed : 0
+  }))
+  const rank = (a, b) => (b.netUsd - a.netUsd) || (b.profitable - a.profitable) || (b.avgRoi - a.avgRoi)
+
+  return {
+    routes: finalize(routes).sort(rank),
+    pairs: finalize(pairs).sort(rank)
   }
 }
 
@@ -176,5 +234,6 @@ module.exports = {
   getTrades,
   getOpportunities,
   computeStats,
+  computeRouteStats,
   tradesCsv
 }

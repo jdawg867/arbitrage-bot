@@ -132,6 +132,11 @@
   </div>
 
   <div class="card">
+    <h2>Route performance (ranked by net USD)</h2>
+    <div id="routesTable"></div>
+  </div>
+
+  <div class="card">
     <h2>Recent trades</h2>
     <div id="tradesTable"></div>
   </div>
@@ -259,6 +264,30 @@ function renderBars(perPair) {
   box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Net profit by pair">${rows}</svg>`
 }
 
+function renderRoutes(routes) {
+  const box = $('routesTable')
+  if (!routes || routes.length === 0) { box.innerHTML = '<div class="empty">No routes evaluated yet.</div>'; return }
+  const rows = routes.slice(0, 15).map((r) => {
+    const cls = r.netUsd > 0 ? 'pos' : r.netUsd < 0 ? 'neg' : ''
+    return `<tr>
+      <td class="l">${esc(r.route)}</td>
+      <td class="l">${esc(r.pair)}</td>
+      <td class="num">${(r.opportunities || 0).toLocaleString()}</td>
+      <td class="num">${(r.profitable || 0).toLocaleString()}</td>
+      <td class="num">${(r.executed || 0).toLocaleString()}</td>
+      <td class="num">${r.executed ? pct(r.winRate) : '—'}</td>
+      <td class="num"><span class="${cls}">${usd(r.netUsd)}</span></td>
+      <td class="num">${(Number(r.avgRoi) || 0).toFixed(3)}%</td>
+    </tr>`
+  }).join('')
+  box.innerHTML = `<table>
+    <thead><tr>
+      <th class="l">Route (buy → sell)</th><th class="l">Pair</th>
+      <th>Opps</th><th>Profitable</th><th>Executed</th><th>Win%</th><th>Net (USD)</th><th>Avg ROI</th>
+    </tr></thead>
+    <tbody>${rows}</tbody></table>`
+}
+
 function renderTable(trades, meta) {
   const box = $('tradesTable')
   if (!trades || trades.length === 0) { box.innerHTML = '<div class="empty">No trades logged yet.</div>'; return }
@@ -302,6 +331,7 @@ async function load() {
     renderRuntime(stats.runtime)
     renderLine(stats.daily)
     renderBars(stats.perPair)
+    renderRoutes(stats.routes)
     renderTable(trades, m)
   } catch (err) {
     $('sub').textContent = 'Error loading data: ' + err.message
