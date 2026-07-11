@@ -6,12 +6,13 @@ const ethers = require("ethers")
 const config = require('./config.json')
 const {
   getPoolContractByAddress,
-  getPoolLiquidity,
+  getPoolTokenBalances,
   calculatePrice,
   discoverPairs
 } = require('./helpers/helpers')
 const { provider, uniswap, pancakeswap, arbitrage } = require('./helpers/initialization')
 const logger = require('./helpers/logger')
+const metrics = require('./helpers/metrics')
 
 // -- MODE -----------------------------------------------------------------
 // The bot runs in one of two fully independent modes, selected in config.json:
@@ -35,6 +36,11 @@ const IS_EXECUTION_MODE = config.PROJECT_SETTINGS.isDeployed === true
 // The signer is only needed to estimate/send transactions, so it exists in
 // execution mode only. It is created once, up front, in assertExecutionReady().
 let account = null
+
+// Latest block height, kept fresh by a single provider 'block' subscription so
+// we never call getBlockNumber() per swap event (see main()). Updated on
+// reconnect too.
+let latestBlock = 0
 
 // -- CONFIGURATION VALUES HERE -- //
 const UNITS = config.PROJECT_SETTINGS.PRICE_UNITS
@@ -144,6 +150,8 @@ const assertExecutionReady = () => {
 }
 
 const main = async () => {
+  metrics.markStart() // uptime counts from here, not module-load time
+
   // -- STARTUP: announce mode & network, and validate execution prerequisites --
   const network = config.PROJECT_SETTINGS.isLocal ? 'local Hardhat fork' : 'Arbitrum One'
   if (IS_EXECUTION_MODE) {
@@ -156,6 +164,11 @@ const main = async () => {
     console.log(`  (set isDeployed=true in config.json to enable execution)`)
   }
   console.log(`Network: ${network}\n`)
+
+  // Keep the latest block height fresh from a single subscription instead of
+  // calling getBlockNumber() on every swap (one RPC at startup, then zero).
+  latestBlock = await provider.getBlockNumber()
+  provider.on('block', (n) => { latestBlock = n })
 
   console.log(`Discovering pairs available on BOTH Uniswap V3 & Pancakeswap V3...\n`)
 
@@ -178,6 +191,7 @@ const main = async () => {
     const pPool = getPoolContractByAddress(pancakeswap, p.pPoolAddress, provider)
 
     const pair = {
+      key: p.key, // stable (addr,addr,fee) id used by the per-pool processing lock
       label: p.label,
       token0: p.token0,
       token1: p.token1,
@@ -243,7 +257,8 @@ const eventHandler = async (_pair) => {
 const checkPrice = async (_pair) => {
   console.log(`Swap Detected on ${_pair.label}, Checking Price...\n`)
 
-  const currentBlock = await provider.getBlockNumber()
+  // Cached from the 'block' subscription — no getBlockNumber() RPC per swap
+  const currentBlock = latestBlock
 
   const uPrice = await calculatePrice(_pair.uPool, _pair.token0, _pair.token1)
   const pPrice = await calculatePrice(_pair.pPool, _pair.token0, _pair.token1)
@@ -386,11 +401,10 @@ const valueInUsdc = async (amountRaw, token) => {
 // The contract's executeTrade takes the two router addresses and the two-token
 // path. Both determineProfitability (gas estimate) and executeTrade need these,
 // so build them in one place. exchangePath[0] is the buy DEX, [1] is the sell DEX.
-const buildTradePaths = async (_exchangePath, _pair) => ({
-  routerPath: [
-    await _exchangePath[0].router.getAddress(),
-    await _exchangePath[1].router.getAddress()
-  ],
+// exchange.routerAddress is cached from config at startup, so this needs no RPC
+// and no contract.getAddress() round-trip. exchangePath[0]=buy, [1]=sell.
+const buildTradePaths = (_exchangePath, _pair) => ({
+  routerPath: [_exchangePath[0].routerAddress, _exchangePath[1].routerAddress],
   tokenPath: [_pair.token0.address, _pair.token1.address]
 })
 
@@ -464,7 +478,10 @@ const determineProfitability = async (_exchangePath, _pair) => {
 
   try {
     // --- 1. Bound the trade size by the buy pool's token0 reserves ---
-    const [buyToken0Reserve] = await getPoolLiquidity(buy.factory, token0, token1, fee, provider)
+    // Use the pool address resolved at discovery time (buy is one of the two
+    // exchange objects); avoids a redundant factory.getPool() RPC per evaluation.
+    const buyPool = buy.name === uniswap.name ? _pair.uPool : _pair.pPool
+    const [buyToken0Reserve] = await getPoolTokenBalances(buyPool.target, token0, token1)
 
     if (buyToken0Reserve === 0n) {
       throw new Error("Buy pool has no token0 liquidity")

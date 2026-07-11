@@ -205,10 +205,21 @@ async function getPoolContract(_exchange, _token0, _token1, _fee, _provider) {
 
 async function getPoolLiquidity(_factory, _token0, _token1, _fee, _provider) {
   const poolAddress = await getPoolAddress(_factory, _token0.address, _token1.address, _fee)
+  return getPoolTokenBalances(poolAddress, _token0, _token1)
+}
 
-  const token0Balance = await _token0.contract.balanceOf(poolAddress)
-  const token1Balance = await _token1.contract.balanceOf(poolAddress)
-
+/**
+ * Token reserves held by a KNOWN pool address. Skips the factory.getPool()
+ * lookup that getPoolLiquidity() performs — during monitoring we already
+ * resolved every pool address at discovery time, so re-deriving it on each
+ * evaluation is a wasted RPC round-trip. The two balance reads run in parallel.
+ * Returns [token0Balance, token1Balance] (raw), identical to getPoolLiquidity.
+ */
+async function getPoolTokenBalances(_poolAddress, _token0, _token1) {
+  const [token0Balance, token1Balance] = await Promise.all([
+    _token0.contract.balanceOf(_poolAddress),
+    _token1.contract.balanceOf(_poolAddress)
+  ])
   return [token0Balance, token1Balance]
 }
 
@@ -252,6 +263,7 @@ module.exports = {
   getPoolContract,
   getPoolContractByAddress,
   getPoolLiquidity,
+  getPoolTokenBalances,
   calculatePrice,
   calculateDifference,
   discoverPairs,
