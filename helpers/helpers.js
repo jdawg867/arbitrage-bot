@@ -86,16 +86,17 @@ async function mapLimit(_items, _limit, _fn) {
 
 /**
  * Auto-discover arbitrage-eligible token pairs on Arbitrum. For each base/quote
- * token pair we probe EVERY configured fee tier on BOTH Uniswap V3 and
- * Pancakeswap V3 and collect all pools that exist. A pair is eligible when it
- * has >= 2 pools across DEXes/fee tiers, since that's the minimum needed for a
- * distinct buy and sell venue (the arbitrage search later forms every ordered
- * buy/sell combination across these pools, including cross-fee-tier and
+ * token pair we probe EVERY configured fee tier on EVERY enabled DEX
+ * (PROJECT_SETTINGS.DEXES) and collect all pools that exist. A pair is eligible
+ * when it has >= 2 pools across DEXes/fee tiers, since that's the minimum needed
+ * for a distinct buy and sell venue (the arbitrage search later forms every
+ * ordered buy/sell combination across these pools, including cross-fee-tier and
  * cross-DEX routes). token0 is always a base token (the one we flash-loan and
- * take profit in). Returns, per pair:
+ * take profit in). `_exchanges` is the id->exchange map from createExchanges().
+ * Returns, per pair:
  *   { key, token0, token1, label, pools: [{ dexId, dexName, fee, address }, …] }
  */
-async function discoverPairs(_uniswap, _pancakeswap, _config, _provider) {
+async function discoverPairs(_exchanges, _config, _provider) {
   const base = _config.TOKENS.BASE
   const quote = _config.TOKENS.QUOTE
   const feeTiers = _config.TOKENS.FEE_TIERS
@@ -126,17 +127,18 @@ async function discoverPairs(_uniswap, _pancakeswap, _config, _provider) {
 
   // One flat probe per (token pair, DEX, fee tier), run at bounded concurrency so
   // discovery never bursts the RPC. (Total getPool calls are the same as before.)
-  // PROJECT_SETTINGS.DEXES selects which DEXes to use (default both). Set it to
-  // ["uni"] to run Uniswap-only cross-fee-tier arbitrage (both legs on deep
-  // Uniswap pools — no thin-Pancake bottleneck); ["pancake"] for Pancake-only.
-  const enabledDexes = _config.PROJECT_SETTINGS.DEXES || ['uni', 'pancake']
-  const exchanges = [
-    { id: 'uni', name: _uniswap.name, factory: _uniswap.factory },
-    { id: 'pancake', name: _pancakeswap.name, factory: _pancakeswap.factory }
-  ].filter((e) => enabledDexes.includes(e.id))
+  // PROJECT_SETTINGS.DEXES selects which DEXes to use (default: all configured).
+  // e.g. ["uni"] = Uniswap-only cross-fee-tier arbitrage (both legs on deep
+  // Uniswap pools); ["uni","sushi"] = Uni<->Sushi cross-DEX; etc. Only ids that
+  // are both enabled AND configured (present in the exchanges map) are probed.
+  const available = Object.keys(_exchanges)
+  const enabledDexes = _config.PROJECT_SETTINGS.DEXES || available
+  const exchanges = available
+    .filter((id) => enabledDexes.includes(id))
+    .map((id) => ({ id, name: _exchanges[id].name, factory: _exchanges[id].factory }))
 
   if (exchanges.length === 0) {
-    throw new Error(`No DEXes enabled — set PROJECT_SETTINGS.DEXES to include "uni" and/or "pancake".`)
+    throw new Error(`No usable DEXes — PROJECT_SETTINGS.DEXES=${JSON.stringify(enabledDexes)} but configured DEXes are ${JSON.stringify(available)}.`)
   }
   // Preflight: confirm the RPC can actually answer eth_call. A rate-limited or
   // mis-provisioned Alchemy key still answers eth_blockNumber but returns empty
@@ -279,10 +281,15 @@ function assignDisplayLabels(pairs) {
   }
 }
 
+// Pancake V3 pools emit a Swap event with extra fields, so they need a custom
+// ABI; Uniswap and SushiSwap (a Uniswap V3 fork) use the standard pool ABI.
+function poolAbiFor(_exchange) {
+  return _exchange.poolType === 'pancakev3' ? IPancakeswapV3Pool : IUniswapV3Pool
+}
+
 // Build a pool contract from an address we already resolved (skips a getPool call)
 function getPoolContractByAddress(_exchange, _poolAddress, _provider) {
-  const poolABI = _exchange.name === "Uniswap V3" ? IUniswapV3Pool : IPancakeswapV3Pool
-  return new ethers.Contract(_poolAddress, poolABI, _provider)
+  return new ethers.Contract(_poolAddress, poolAbiFor(_exchange), _provider)
 }
 
 async function getPoolAddress(_factory, _token0, _token1, _fee) {
@@ -292,8 +299,7 @@ async function getPoolAddress(_factory, _token0, _token1, _fee) {
 
 async function getPoolContract(_exchange, _token0, _token1, _fee, _provider) {
   const poolAddress = await getPoolAddress(_exchange.factory, _token0, _token1, _fee)
-  const poolABI = _exchange.name === "Uniswap V3" ? IUniswapV3Pool : IPancakeswapV3Pool
-  const pool = new ethers.Contract(poolAddress, poolABI, _provider)
+  const pool = new ethers.Contract(poolAddress, poolAbiFor(_exchange), _provider)
   return pool
 }
 

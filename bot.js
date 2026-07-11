@@ -19,7 +19,8 @@ const { withRetry } = require('./helpers/rpc')
 // Connection objects — (re)assigned by buildConnection() at startup and on every
 // websocket reconnect. Declared with `let` so every function below closes over
 // these module-level bindings and automatically uses the current instances.
-let provider, uniswap, pancakeswap, arbitrage
+let provider, arbitrage
+let exchanges = {} // id -> exchange, from init.createExchanges() (rebuilt on reconnect)
 
 // -- SAFETY NET --
 // A 24/7 monitor must never die on a stray async error. Per-event errors are
@@ -229,7 +230,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
  */
 const buildConnection = () => {
   provider = init.createProvider()
-  ;({ uniswap, pancakeswap } = init.createExchanges(provider))
+  exchanges = init.createExchanges(provider)
   arbitrage = IS_EXECUTION_MODE ? init.createArbitrage(provider) : null
   account = IS_EXECUTION_MODE ? new ethers.Wallet(process.env.PRIVATE_KEY, provider) : null
 
@@ -242,7 +243,7 @@ const buildConnection = () => {
 
 // Resolve a discovered pool's DEX id to the CURRENT exchange object (rebuilt on
 // each reconnect), so pool contracts and quoters always use the live provider.
-const exchangeFor = (dexId) => (dexId === 'uni' ? uniswap : pancakeswap)
+const exchangeFor = (dexId) => exchanges[dexId]
 
 // Rebuild pool contracts for every discovered pair against the CURRENT provider
 // and subscribe to the Swap event on ALL of the pair's pools (any swap on any
@@ -353,7 +354,7 @@ const main = async () => {
 
   console.log(`Discovering pairs available on BOTH Uniswap V3 & Pancakeswap V3...\n`)
 
-  discoveredPairs = await discoverPairs(uniswap, pancakeswap, config, provider)
+  discoveredPairs = await discoverPairs(exchanges, config, provider)
 
   if (discoveredPairs.length === 0) {
     console.log(`No overlapping pairs found. Check your token list / network in config.json.\n`)
@@ -654,7 +655,7 @@ const gasCostInToken0 = async (gasCostWei, token0) => {
 
   // Probe fee tiers / exchanges for any usable WETH/token0 pool
   for (const fee of config.TOKENS.FEE_TIERS) {
-    for (const ex of [uniswap, pancakeswap]) {
+    for (const ex of Object.values(exchanges)) {
       try {
         const out = await _quoteWethToToken0(ex.quoter, fee, gasCostWei, token0)
         _gasPoolCache.set(token0.address, { quoter: ex.quoter, fee })
@@ -698,7 +699,7 @@ const valueInUsdc = async (amountRaw, token) => {
   }
 
   for (const fee of config.TOKENS.FEE_TIERS) {
-    for (const ex of [uniswap, pancakeswap]) {
+    for (const ex of Object.values(exchanges)) {
       try {
         const out = await _quoteToUsdc(ex.quoter, fee, amountRaw, token)
         _usdcPoolCache.set(token.address, { quoter: ex.quoter, fee })

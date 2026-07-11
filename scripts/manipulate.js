@@ -8,10 +8,12 @@ const { createProvider, createExchanges } = require('../helpers/initialization.j
 // Build a dedicated connection for this one-off script (initialization no longer
 // creates eager instances — see helpers/initialization.js).
 const provider = createProvider()
-const { uniswap, pancakeswap } = createExchanges(provider)
+const exchanges = createExchanges(provider) // id -> exchange map
 
 // -- CONFIGURE VALUES HERE (see config.json -> MANIPULATE) -- //
-const EXCHANGE_TO_USE = config.MANIPULATE.EXCHANGE === 'uniswap' ? uniswap : pancakeswap
+// config.MANIPULATE.EXCHANGE may be a full name ("uniswap") or a DEX id ("uni").
+const NAME_TO_ID = { uniswap: 'uni', pancakeswap: 'pancake', sushiswap: 'sushi' }
+const EXCHANGE_TO_USE = exchanges[NAME_TO_ID[config.MANIPULATE.EXCHANGE] || config.MANIPULATE.EXCHANGE]
 
 const UNLOCKED_ACCOUNT = config.MANIPULATE.UNLOCKED_ACCOUNT // Account to impersonate
 const AMOUNT = config.MANIPULATE.AMOUNT // Amount of tokens to swap

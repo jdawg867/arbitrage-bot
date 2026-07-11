@@ -136,6 +136,11 @@ defaults with a placeholder `ARBITRAGE_ADDRESS`.
 - `GAS_LIMIT` / `GAS_PRICE` — legacy fields, no longer used (the strategy now estimates
   real gas via `estimateGas`).
 - `DISCOVERY_CONCURRENCY` — how many factory probes run at once during discovery.
+- `DEXES` — which DEXes to trade across, by id: `uni`, `pancake`, `sushi` (default all
+  configured). The search forms every buy/sell route across the enabled DEXes **and**
+  their fee tiers. Examples: `["uni"]` = Uniswap-only cross-fee-tier arbitrage (both legs
+  on deep Uniswap pools); `["uni","sushi"]` = Uniswap↔SushiSwap cross-DEX. Each id needs a
+  matching top-level config block (`UNISWAP` / `PANCAKESWAP` / `SUSHISWAP`).
 
 **`STRATEGY`** (tunes `determineProfitability`)
 - `MIN_PROFIT_BPS` — minimum gross profit as basis points of the flash amount (e.g. `10` = 0.1%).
