@@ -143,6 +143,7 @@ const buildRecord = (status, _pair, priceInfo, metrics, extra = {}) => {
     gasCostUsd: fmtUsd(m.gasCostUsd),
     netProfitUsd: fmtUsd(m.netProfitUsd),
     roiPct: m.roiPct ?? null,
+    optimizer: m.optimizer ?? null,
     txHash: null,
     blockNumber: null,
     reason: extra.reason ?? null
@@ -156,6 +157,10 @@ const buildExecutedRecord = async (_pair, priceInfo, metrics, exec) => {
   const realizedGross = exec.realizedGross
   const gasBase = exec.gasBase
   const netRaw = gasBase === null ? null : realizedGross - gasBase
+
+  // Estimated (pre-send) vs realized, so the record shows any discrepancy.
+  const estNet = m.netProfit // token0, from the pre-send quote + gas estimate
+  const estGross = m.grossProfit
 
   return {
     ...baseRecord('executed', _pair, priceInfo),
@@ -172,6 +177,15 @@ const buildExecutedRecord = async (_pair, priceInfo, metrics, exec) => {
     gasCostUsd: fmtUsd(await valueInUsdc(gasBase, t0)),
     netProfitUsd: fmtUsd(await valueInUsdc(netRaw, t0)),
     roiPct: m.roiPct ?? null,
+    // Estimated-vs-realized (the discrepancy audit trail)
+    estimatedGrossProfit: fmtOrNull(estGross, t0),
+    estimatedNetProfit: fmtOrNull(estNet, t0),
+    estimatedNetProfitUsd: fmtUsd(m.netProfitUsd),
+    realizedNetProfit: fmtOrNull(netRaw, t0),
+    realizedNetProfitUsd: fmtUsd(await valueInUsdc(netRaw, t0)),
+    grossDrift: (estGross === undefined || estGross === null) ? null : fmtOrNull(realizedGross - estGross, t0),
+    gasDrift: (gasBase === null || m.gasCostBase === undefined || m.gasCostBase === null) ? null : fmtOrNull(gasBase - m.gasCostBase, t0),
+    optimizer: m.optimizer ?? null,
     txHash: exec.txHash,
     blockNumber: exec.blockNumber,
     reason: null
@@ -510,6 +524,10 @@ const eventHandler = async (_pair) => {
     }
 
     m.grossProfitUsd = await valueInUsdc(m.grossProfit, token0)
+    // Optimizer diagnostics recorded on the outcome: max profitable size, how
+    // many sizes were tried, why larger sizes lose, and the net-profit curve —
+    // proving we picked the profit-maximising size, not the first profitable one.
+    m.optimizer = buildOptimizerDiagnostics(bestEval, token0, m.gasCostBase)
     metrics.incr('profitableOpportunities')
 
     if (!IS_EXECUTION_MODE) {
@@ -528,6 +546,8 @@ const eventHandler = async (_pair) => {
     try {
       const exec = await executeTrade(combo, _pair, m.flashAmount)
       metrics.incr('tradesExecuted')
+      // Log estimated (pre-send) vs realized net + attribute any discrepancy.
+      logExecutionOutcome(_pair, token0, m, exec)
       logger.recordOutcome(await buildExecutedRecord(_pair, priceInfo, m, exec))
       console.log(`Trade logged${exec.txHash ? ` (tx ${exec.txHash})` : ''}\n`)
     } finally {
@@ -691,12 +711,20 @@ const _quoteToUsdc = async (quoter, fee, amountRaw, token) => {
 const valueInUsdc = async (amountRaw, token) => {
   if (amountRaw === null || amountRaw === undefined) return null
   if (amountRaw === 0n) return 0n
-  if (token.address.toLowerCase() === USDC_ADDRESS.toLowerCase()) return amountRaw
+
+  // Quoters reject a negative amountIn (uint256), which previously made a
+  // negative net profit price to null. Price the ABSOLUTE amount, then re-apply
+  // the sign so a loss yields a negative USD value instead of null.
+  const negative = amountRaw < 0n
+  const abs = negative ? -amountRaw : amountRaw
+  const signed = (v) => (v === null || v === undefined ? null : (negative ? -v : v))
+
+  if (token.address.toLowerCase() === USDC_ADDRESS.toLowerCase()) return signed(abs)
 
   const cached = _usdcPoolCache.get(token.address)
   if (cached) {
     try {
-      return await _quoteToUsdc(cached.quoter, cached.fee, amountRaw, token)
+      return signed(await _quoteToUsdc(cached.quoter, cached.fee, abs, token))
     } catch (err) {
       _usdcPoolCache.delete(token.address)
     }
@@ -705,9 +733,9 @@ const valueInUsdc = async (amountRaw, token) => {
   for (const fee of config.TOKENS.FEE_TIERS) {
     for (const ex of Object.values(exchanges)) {
       try {
-        const out = await _quoteToUsdc(ex.quoter, fee, amountRaw, token)
+        const out = await _quoteToUsdc(ex.quoter, fee, abs, token)
         _usdcPoolCache.set(token.address, { quoter: ex.quoter, fee })
-        return out
+        return signed(out)
       } catch (err) {
         // no token/USDC pool at this (exchange, fee) — keep trying
       }
@@ -780,12 +808,18 @@ const printProfitabilityTable = (_pair, m, token0) => {
  * Maximise round-trip token0 profit over the feasible flash-loan range
  * (0, maxFlash]. A coarse geometric grid locates the profit hump; ternary search
  * refines the peak. Maximising GROSS profit also maximises NET, since gas is
- * ~independent of trade size. Returns { amount, profit, capped } or null if no
- * size is quotable. Shared by every buy/sell combo. `_roundTrip(amount)` returns
- * the token0 profit for that flash size (or null if unquotable).
+ * ~independent of trade size. Returns { amount, profit, capped, samples } or null
+ * if no size is quotable. `samples` is every (size, gross-profit) pair tried
+ * (profit null = unquotable size), for the executed-trade diagnostics. Shared by
+ * every combo. `_roundTrip(amount)` returns the token0 profit (or null).
  */
 const maximizeProfit = async (_roundTrip, _maxFlash) => {
-  const evaluate = async (amount) => ({ amount, profit: await _roundTrip(amount) })
+  const samples = [] // every size tried, for diagnostics / the net-profit curve
+  const evaluate = async (amount) => {
+    const profit = await _roundTrip(amount)
+    samples.push({ amount, profit })
+    return { amount, profit }
+  }
 
   // Coarse geometric grid up to maxFlash, de-duplicated and positive (small pools
   // collapse the high-order shifts to 0/duplicates, which would waste quotes and
@@ -818,7 +852,7 @@ const maximizeProfit = async (_roundTrip, _maxFlash) => {
     else { hi = m2; if (p1 > best.profit) best = r1 }
   }
 
-  return { amount: best.amount, profit: best.profit, capped: best.amount >= grid[grid.length - 1] }
+  return { amount: best.amount, profit: best.profit, capped: best.amount >= grid[grid.length - 1], samples }
 }
 
 /**
@@ -878,11 +912,79 @@ const evaluateCombo = async (_pair, _combo) => {
       flashAmount: opt.amount,
       grossProfit: opt.profit,
       roiPct: Number((opt.profit * 1000000n) / opt.amount) / 10000,
-      capped: opt.capped
+      capped: opt.capped,
+      samples: opt.samples // every (size, gross-profit) tried — for diagnostics
     }
   } catch (err) {
     return null
   }
+}
+
+/**
+ * Build the optimizer diagnostics recorded on an executed trade, from the size
+ * search's samples. Confirms the optimizer maximised net profit (not the first
+ * profitable size) and explains why larger sizes lost. `gasBase` (token0,
+ * ~constant across sizes) turns each gross sample into a net-profit point.
+ */
+const buildOptimizerDiagnostics = (_eval, token0, gasBase) => {
+  const samples = (_eval.samples || []).slice().sort((a, b) => (a.amount < b.amount ? -1 : a.amount > b.amount ? 1 : 0))
+  const gas = (gasBase === null || gasBase === undefined) ? 0n : gasBase
+  const best = _eval.flashAmount
+
+  // Net-profit curve across every tested size (net = gross - gas).
+  const netCurve = samples.map((s) => ({
+    flashAmount: fmt(s.amount, token0),
+    grossProfit: s.profit === null ? null : fmt(s.profit, token0),
+    netProfit: s.profit === null ? null : fmt(s.profit - gas, token0)
+  }))
+
+  // Why larger sizes were rejected: examine samples above the chosen size.
+  const larger = samples.filter((s) => s.amount > best)
+  const unquotableAbove = larger.some((s) => s.profit === null)
+  const declined = larger.some((s) => s.profit !== null && s.profit < _eval.grossProfit)
+  const reasons = []
+  if (declined) reasons.push('slippage (round-trip profit peaks then declines as price impact grows with size)')
+  if (unquotableAbove) reasons.push('liquidity (larger sizes exceed available pool liquidity and are unquotable)')
+  if (_eval.capped) reasons.push(`MAX_POOL_FRACTION cap (${MAX_POOL_FRACTION} of buy-pool token0) — optimum sat at the cap`)
+  // Flash-loan fee is 0 (Balancer); gas is ~constant across sizes so it never
+  // rejects a specific size — it's applied once to the chosen size.
+  if (reasons.length === 0) reasons.push('chosen size was the largest feasible and most profitable')
+
+  return {
+    maxProfitableFlash: fmt(best, token0),
+    sizesEvaluated: samples.length,
+    largerSizesRejectedBecause: reasons.join('; '),
+    flashLoanFee: '0 (Balancer)',
+    netProfitCurve: netCurve
+  }
+}
+
+/**
+ * EXECUTION MODE. Log the pre-send estimate vs the realized on-chain outcome and
+ * attribute any discrepancy (price drift vs gas change). The pre-send gate only
+ * lets estimated-net-positive trades through, so a NEGATIVE realized net can
+ * only come from drift between estimate and block inclusion — surfaced loudly.
+ */
+const logExecutionOutcome = (_pair, token0, m, exec) => {
+  const s = (v) => ((v === null || v === undefined) ? 'n/a' : `${fmt(v, token0)} ${token0.symbol}`)
+  const realizedNet = exec.gasBase === null ? null : exec.realizedGross - exec.gasBase
+  const grossDrift = (m.grossProfit === undefined || m.grossProfit === null) ? null : exec.realizedGross - m.grossProfit
+  const gasDrift = (exec.gasBase === null || m.gasCostBase === undefined || m.gasCostBase === null) ? null : exec.gasBase - m.gasCostBase
+
+  console.log(`Execution result — ${_pair.label}  (${m.buyOn} -> ${m.sellOn})`)
+  console.log(`  Estimated net (pre-send): ${s(m.netProfit)}`)
+  console.log(`  Estimated gas:            ${s(m.gasCostBase)}`)
+  console.log(`  Realized gross:           ${s(exec.realizedGross)}`)
+  console.log(`  Actual gas:               ${s(exec.gasBase)}  (${ethers.formatUnits(exec.gasSpentWei, 18)} ETH)`)
+  console.log(`  Realized net:             ${s(realizedNet)}`)
+  console.log(`  Discrepancy: gross ${s(grossDrift)} (execution price vs quote), gas ${s(gasDrift)} (actual vs estimate)`)
+  if (realizedNet !== null && realizedNet < 0n) {
+    const cause = (gasDrift !== null && gasDrift > 0n) ? 'gas rose after estimation'
+      : (grossDrift !== null && grossDrift < 0n) ? 'execution price moved against us vs the quote'
+        : 'post-estimate drift'
+    console.log(`  WARNING: realized net NEGATIVE despite a positive pre-send estimate — cause: ${cause}. The pre-send gate blocks negative-ESTIMATED-net trades, so a realized loss can only come from drift between estimate and block inclusion.`)
+  }
+  console.log(`-----------------------------------------\n`)
 }
 
 // EXECUTION MODE ONLY. Fire the flash-loan arbitrage through the deployed
