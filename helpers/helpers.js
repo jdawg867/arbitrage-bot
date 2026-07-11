@@ -95,6 +95,13 @@ async function discoverPairs(_uniswap, _pancakeswap, _config, _provider) {
   const feeTiers = _config.TOKENS.FEE_TIERS
   const limit = _config.PROJECT_SETTINGS.DISCOVERY_CONCURRENCY || 8
 
+  // Stablecoin<->stablecoin pairs (USDC/USDC.e, USDC/USDT, DAI/USDC, …) have
+  // spreads too small to clear fees + gas, so skip them when configured. A pair
+  // is stable<->stable only when BOTH tokens are in TOKENS.STABLES; stable/volatile
+  // pairs (USDC/WETH, DAI/WETH, ARB/USDC, …) are kept.
+  const stables = new Set((_config.TOKENS.STABLES || []).map((a) => ethers.getAddress(a)))
+  const skipStablePairs = _config.PROJECT_SETTINGS.SKIP_STABLE_PAIRS === true
+
   // Build the unique set of combos to probe. token0 = base, token1 = any other token.
   const seen = new Set()
   const combos = []
@@ -105,6 +112,9 @@ async function discoverPairs(_uniswap, _pancakeswap, _config, _provider) {
     for (const quoteAddrRaw of Object.values(quote)) {
       const quoteAddr = ethers.getAddress(quoteAddrRaw)
       if (baseAddr === quoteAddr) continue
+
+      // Drop stable<->stable combos entirely (both tokens are stablecoins)
+      if (skipStablePairs && stables.has(baseAddr) && stables.has(quoteAddr)) continue
 
       for (const fee of feeTiers) {
         const key = [baseAddr, quoteAddr].sort().join('-') + '-' + fee
