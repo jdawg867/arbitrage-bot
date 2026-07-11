@@ -23,7 +23,7 @@ describe("Arbitrage", () => {
     // call reverts up front (no mainnet fork needed to exercise this path).
     it("Reverts executeTrade for a non-owner", async () => {
       await expect(
-        arbitrage.connect(stranger).executeTrade([], [], 500, 1)
+        arbitrage.connect(stranger).executeTrade([], [], 500, 500, 1)
       ).to.be.revertedWith("Arbitrage: caller is not the owner")
     })
   })
