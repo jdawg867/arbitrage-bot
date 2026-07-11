@@ -21,12 +21,18 @@ contract Arbitrage is IFlashLoanRecipient {
         owner = msg.sender;
     }
 
+    // Restricts a function to the contract owner (the deployer / bot account).
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Arbitrage: caller is not the owner");
+        _;
+    }
+
     function executeTrade(
         address[] memory _routerPath,
         address[] memory _tokenPath,
         uint24 _fee,
         uint256 _flashAmount
-    ) external {
+    ) external onlyOwner {
         bytes memory data = abi.encode(
             Trade({routerPath: _routerPath, tokenPath: _tokenPath, fee: _fee})
         );

@@ -56,13 +56,19 @@ For each opportunity the bot:
 3. **Searches for the profit-maximising size** — profit vs. size is a hump (too small
    earns nothing, too big lets slippage eat the spread). A coarse geometric grid
    (`SEARCH_STEPS`) finds the region, then a ternary refinement (`REFINE_ITERS`) hones in.
-4. **Gates the trade** — rejects unless gross profit clears `MIN_PROFIT_BPS` (basis
-   points of the flash amount) **and** beats gas. Gas is estimated in ETH and converted
-   into the base token so net-of-gas accounting is exact for any base: 1:1 for a WETH
-   base, and via a WETH→base pool quote for stablecoin bases (USDC/USDT).
-5. **Confirms executability** — runs `estimateGas` on the real `executeTrade`, which
-   simulates the whole flash loan and reverts if it wouldn't repay; that also gives the
-   real gas cost.
+4. **Gates the trade (gross)** — rejects unless gross profit clears `MIN_PROFIT_BPS`
+   (basis points of the flash amount). This gate runs in **both** modes.
+5. **Gates the trade (net) & confirms executability — execution mode only** — when
+   `isDeployed = true`, the bot additionally runs `estimateGas` on the real
+   `executeTrade`, which simulates the whole flash loan and reverts if it wouldn't
+   repay; that also gives the real gas cost. Gas is priced in ETH and converted into
+   the base token so net-of-gas accounting is exact for any base: 1:1 for a WETH base,
+   and via a WETH→base pool quote for stablecoin bases (USDC/USDT). The trade is
+   rejected unless the profit beats gas.
+
+   In **monitor mode** (`isDeployed = false`) there is no deployed contract to estimate
+   gas against and no transaction is ever sent, so this step is skipped and the logged
+   opportunity carries gross-only metrics (gas / net fields are `null`).
 
 Tune it via the `STRATEGY` block in `config.json`. If no WETH/base pool can be found to
 price gas (rare), the bot falls back to the `MIN_PROFIT_BPS` gate alone and says so in
