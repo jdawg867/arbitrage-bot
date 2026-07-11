@@ -5,6 +5,7 @@ const cors = require('cors')
 
 const config = require('../config.json')
 const logger = require('./logger')
+const metrics = require('./metrics')
 
 // SERVER CONFIG
 const PORT = process.env.PORT || 5000
@@ -42,10 +43,17 @@ app.get('/api/stats', (req, res) => {
       isDeployed: config.PROJECT_SETTINGS.isDeployed,
       explorerTx: config.PROJECT_SETTINGS.isLocal ? null : 'https://arbiscan.io/tx/'
     }
+    // Live runtime metrics (this process, since start) for the health panel
+    stats.runtime = metrics.snapshot()
     res.json(stats)
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
+})
+
+// Live runtime metrics on their own, for lightweight polling / external checks
+app.get('/api/metrics', (req, res) => {
+  res.json(metrics.snapshot())
 })
 
 app.get('/api/trades', (req, res) => {
