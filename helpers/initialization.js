@@ -2,10 +2,12 @@ require("dotenv").config()
 const ethers = require('ethers')
 
 /**
- * This file could be used for initializing some
- * of the main contracts such as the V3 router & 
- * factory. This is also where we initialize the
- * main Arbitrage contract.
+ * Connection factories for the provider and the DEX / Arbitrage contracts.
+ *
+ * Nothing is created at import time — callers build a provider and the contract
+ * set explicitly. This lets the bot tear everything down and rebuild it against
+ * a fresh provider on a websocket reconnect (see bot.js), and lets scripts spin
+ * up their own connection independently.
  */
 
 const config = require('../config.json')
@@ -14,7 +16,7 @@ const IUniswapV3Factory = require('@uniswap/v3-core/artifacts/contracts/interfac
 const IQuoter = require('@uniswap/v3-periphery/artifacts/contracts/interfaces/IQuoterV2.sol/IQuoterV2.json')
 const ISwapRouter = require('@uniswap/v3-periphery/artifacts/contracts/interfaces/ISwapRouter.sol/ISwapRouter.json')
 
-// Build the RPC URL once. Exported so a reconnect can recreate the provider.
+// WebSocket RPC endpoint (local Hardhat fork or live Arbitrum via Alchemy).
 function providerUrl() {
   return config.PROJECT_SETTINGS.isLocal
     ? `ws://127.0.0.1:8545/`
@@ -40,54 +42,48 @@ function createProvider() {
   return instrumentProvider(new ethers.WebSocketProvider(providerUrl()))
 }
 
-const provider = createProvider()
-
 // -- SETUP UNISWAP/PANCAKESWAP CONTRACTS -- //
 // Router addresses are static config values, so cache them on the exchange
 // object instead of resolving contract.getAddress() on every trade evaluation.
-const uniswap = {
-  name: "Uniswap V3",
-  routerAddress: ethers.getAddress(config.UNISWAP.ROUTER_V3),
-  factory: new ethers.Contract(config.UNISWAP.FACTORY_V3, IUniswapV3Factory.abi, provider),
-  quoter: new ethers.Contract(config.UNISWAP.QUOTER_V3, IQuoter.abi, provider),
-  router: new ethers.Contract(config.UNISWAP.ROUTER_V3, ISwapRouter.abi, provider)
-}
+function createExchanges(provider) {
+  const uniswap = {
+    name: "Uniswap V3",
+    routerAddress: ethers.getAddress(config.UNISWAP.ROUTER_V3),
+    factory: new ethers.Contract(config.UNISWAP.FACTORY_V3, IUniswapV3Factory.abi, provider),
+    quoter: new ethers.Contract(config.UNISWAP.QUOTER_V3, IQuoter.abi, provider),
+    router: new ethers.Contract(config.UNISWAP.ROUTER_V3, ISwapRouter.abi, provider)
+  }
 
-const pancakeswap = {
-  name: "Pancakeswap V3",
-  routerAddress: ethers.getAddress(config.PANCAKESWAP.ROUTER_V3),
-  factory: new ethers.Contract(config.PANCAKESWAP.FACTORY_V3, IUniswapV3Factory.abi, provider),
-  quoter: new ethers.Contract(config.PANCAKESWAP.QUOTER_V3, IQuoter.abi, provider),
-  router: new ethers.Contract(config.PANCAKESWAP.ROUTER_V3, ISwapRouter.abi, provider)
+  const pancakeswap = {
+    name: "Pancakeswap V3",
+    routerAddress: ethers.getAddress(config.PANCAKESWAP.ROUTER_V3),
+    factory: new ethers.Contract(config.PANCAKESWAP.FACTORY_V3, IUniswapV3Factory.abi, provider),
+    quoter: new ethers.Contract(config.PANCAKESWAP.QUOTER_V3, IQuoter.abi, provider),
+    router: new ethers.Contract(config.PANCAKESWAP.ROUTER_V3, ISwapRouter.abi, provider)
+  }
+
+  return { uniswap, pancakeswap }
 }
 
 // -- ARBITRAGE CONTRACT (EXECUTION MODE ONLY) -- //
-// The deployed Arbitrage contract is only needed when the bot is going to send
-// trades (isDeployed === true). In monitor mode we skip this entirely: no ABI
-// artifact is loaded (so no `npx hardhat compile` step is required), no address
-// is validated, and `arbitrage` stays null. Nothing downstream may reference
-// `arbitrage` unless execution mode is enabled.
-let arbitrage = null
-
-if (
-  config.PROJECT_SETTINGS.isDeployed &&
-  config.PROJECT_SETTINGS.ARBITRAGE_ADDRESS &&
-  ethers.isAddress(config.PROJECT_SETTINGS.ARBITRAGE_ADDRESS)
-) {
-  // Required lazily so monitor mode never depends on the compiled artifact.
-  const IArbitrage = require('../artifacts/contracts/Arbitrage.sol/Arbitrage.json')
-  arbitrage = new ethers.Contract(
-    config.PROJECT_SETTINGS.ARBITRAGE_ADDRESS,
-    IArbitrage.abi,
-    provider
-  )
+// Returns the deployed Arbitrage contract, or null in monitor mode / when no
+// valid ARBITRAGE_ADDRESS is configured. In monitor mode no ABI artifact is
+// loaded (so no `npx hardhat compile` step is required). Nothing downstream may
+// reference the contract unless execution mode is enabled.
+function createArbitrage(provider) {
+  const s = config.PROJECT_SETTINGS
+  if (s.isDeployed && s.ARBITRAGE_ADDRESS && ethers.isAddress(s.ARBITRAGE_ADDRESS)) {
+    // Required lazily so monitor mode never depends on the compiled artifact.
+    const IArbitrage = require('../artifacts/contracts/Arbitrage.sol/Arbitrage.json')
+    return new ethers.Contract(s.ARBITRAGE_ADDRESS, IArbitrage.abi, provider)
+  }
+  return null
 }
 
 module.exports = {
-  provider,
-  uniswap,
-  pancakeswap,
-  arbitrage,
+  providerUrl,
+  instrumentProvider,
   createProvider,
-  instrumentProvider
+  createExchanges,
+  createArbitrage
 }

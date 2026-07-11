@@ -8,12 +8,18 @@ const {
   getPoolContractByAddress,
   getPoolTokenBalances,
   calculatePrice,
-  discoverPairs
+  discoverPairs,
+  rebindTokenProvider
 } = require('./helpers/helpers')
-const { provider, uniswap, pancakeswap, arbitrage } = require('./helpers/initialization')
+const init = require('./helpers/initialization')
 const logger = require('./helpers/logger')
 const metrics = require('./helpers/metrics')
 const { withRetry } = require('./helpers/rpc')
+
+// Connection objects — (re)assigned by buildConnection() at startup and on every
+// websocket reconnect. Declared with `let` so every function below closes over
+// these module-level bindings and automatically uses the current instances.
+let provider, uniswap, pancakeswap, arbitrage
 
 // -- SAFETY NET --
 // A 24/7 monitor must never die on a stray async error. Per-event errors are
@@ -153,65 +159,64 @@ const processing = new Set()
 let tradeInFlight = false
 
 /**
- * EXECUTION MODE precondition check. Fails fast (before any pools are watched)
- * with an actionable message if the config asks us to trade but isn't set up to,
- * and creates the shared signer. Never called in monitor mode.
+ * EXECUTION MODE precondition check. Fails fast (before we even connect) with an
+ * actionable message if the config asks us to trade but isn't set up to. Never
+ * called in monitor mode. The signer/contract themselves are built in
+ * buildConnection().
  */
 const assertExecutionReady = () => {
-  if (!arbitrage) {
+  const addr = config.PROJECT_SETTINGS.ARBITRAGE_ADDRESS
+  if (!addr || !ethers.isAddress(addr)) {
     throw new Error(
-      "Execution mode (isDeployed=true) requires a deployed Arbitrage contract, but none was " +
-      "initialized. Set a valid ARBITRAGE_ADDRESS in config.json (and deploy the contract), " +
-      "or set isDeployed=false to run in monitor-only mode."
+      "Execution mode (isDeployed=true) requires a valid ARBITRAGE_ADDRESS in config.json " +
+      "(deploy the contract first), or set isDeployed=false to run in monitor-only mode."
     )
   }
   if (!process.env.PRIVATE_KEY) {
     throw new Error("Execution mode requires PRIVATE_KEY in .env to sign transactions.")
   }
-  account = new ethers.Wallet(process.env.PRIVATE_KEY, provider)
 }
 
-const main = async () => {
-  metrics.markStart() // uptime counts from here, not module-load time
+// -- CONNECTION LIFECYCLE (auto-reconnect) --------------------------------
+// Discovered pair DATA (token metadata + resolved pool addresses) persists
+// across reconnects — only the provider-bound contract objects go stale — so a
+// reconnect never re-runs discovery.
+let discoveredPairs = []   // immutable pair descriptors from discoverPairs()
+let watchedPairs = []      // live pair objects with current pool contracts
+let reconnecting = false
+const RECONNECT_BACKOFF_MS = [1000, 2000, 5000, 10000] // caps at the last value
 
-  // -- STARTUP: announce mode & network, and validate execution prerequisites --
-  const network = config.PROJECT_SETTINGS.isLocal ? 'local Hardhat fork' : 'Arbitrum One'
-  if (IS_EXECUTION_MODE) {
-    assertExecutionReady()
-    console.log(`Mode: EXECUTION — profitable opportunities WILL be traded.`)
-    console.log(`  Contract: ${config.PROJECT_SETTINGS.ARBITRAGE_ADDRESS}`)
-    console.log(`  Signer:   ${account.address}`)
-  } else {
-    console.log(`Mode: MONITOR — opportunities are detected & logged only; no trades are sent.`)
-    console.log(`  (set isDeployed=true in config.json to enable execution)`)
-  }
-  console.log(`Network: ${network}\n`)
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
-  // Keep the latest block height fresh from a single subscription instead of
-  // calling getBlockNumber() on every swap (one RPC at startup, then zero).
-  latestBlock = await provider.getBlockNumber()
+/**
+ * (Re)build the whole connection: a fresh provider, the DEX + Arbitrage
+ * contracts and signer bound to it, the block-height subscription, and the
+ * socket-close handler that triggers reconnect.
+ */
+const buildConnection = () => {
+  provider = init.createProvider()
+  ;({ uniswap, pancakeswap } = init.createExchanges(provider))
+  arbitrage = IS_EXECUTION_MODE ? init.createArbitrage(provider) : null
+  account = IS_EXECUTION_MODE ? new ethers.Wallet(process.env.PRIVATE_KEY, provider) : null
+
+  // Cache the latest block height from a single push subscription (no
+  // getBlockNumber() per swap).
   provider.on('block', (n) => { latestBlock = n })
 
-  console.log(`Discovering pairs available on BOTH Uniswap V3 & Pancakeswap V3...\n`)
+  attachDisconnectHandler()
+}
 
-  const discovered = await discoverPairs(uniswap, pancakeswap, config, provider)
-
-  if (discovered.length === 0) {
-    console.log(`No overlapping pairs found. Check your token list / network in config.json.\n`)
-    return
+// Rebuild pool contracts for every discovered pair against the CURRENT provider
+// and subscribe to both sides' Swap events. Old listeners are torn down first so
+// a reconnect never leaves duplicate subscriptions behind.
+const subscribeAll = () => {
+  for (const p of watchedPairs) {
+    try { p.uPool.removeAllListeners(); p.pPool.removeAllListeners() } catch (e) { /* dead socket */ }
   }
 
-  console.log(`Found ${discovered.length} arbitrage-eligible pair(s):`)
-  for (const p of discovered) {
-    console.log(`  - ${p.label}`)
-  }
-  console.log("")
-
-  // Build pool contracts for each discovered pair and subscribe to swaps on both sides
-  for (const p of discovered) {
+  watchedPairs = discoveredPairs.map((p) => {
     const uPool = getPoolContractByAddress(uniswap, p.uPoolAddress, provider)
     const pPool = getPoolContractByAddress(pancakeswap, p.pPoolAddress, provider)
-
     const pair = {
       key: p.key, // stable (addr,addr,fee) id used by the per-pool processing lock
       label: p.label,
@@ -221,12 +226,100 @@ const main = async () => {
       uPool,
       pPool
     }
-
     uPool.on('Swap', () => eventHandler(pair))
     pPool.on('Swap', () => eventHandler(pair))
+    return pair
+  })
+}
+
+// Hook the underlying websocket's close/error so a dropped connection triggers
+// an automatic reconnect. ethers v6 leaves onclose/onerror unset, so this is safe.
+const attachDisconnectHandler = () => {
+  try {
+    const ws = provider.websocket
+    ws.onclose = () => { console.error('\nWebSocket closed.'); scheduleReconnect() }
+    ws.onerror = (e) => { console.error(`\nWebSocket error: ${(e && e.message) || ''}`); scheduleReconnect() }
+  } catch (e) {
+    // websocket not available yet — the next error will re-trigger reconnect
+  }
+}
+
+/**
+ * Automatically reconnect after a websocket drop: tear down the dead
+ * connection, then retry (with backoff) rebuilding the provider, contracts,
+ * token contracts and Swap subscriptions until we're live again. No discovery,
+ * no manual restart. Guarded so overlapping close/error events reconnect once.
+ */
+const scheduleReconnect = async () => {
+  if (reconnecting) return
+  reconnecting = true
+  metrics.incr('wsReconnects')
+
+  // Best-effort teardown of the dead connection and its stale, provider-bound caches.
+  try { provider.websocket.onclose = null; provider.websocket.onerror = null } catch (e) { /* noop */ }
+  try { for (const p of watchedPairs) { p.uPool.removeAllListeners(); p.pPool.removeAllListeners() } } catch (e) { /* noop */ }
+  try { await provider.destroy() } catch (e) { /* noop */ }
+  _gasPoolCache.clear()   // held quoter refs bound to the dead provider
+  _usdcPoolCache.clear()
+
+  for (let attempt = 0; ; attempt++) {
+    const delay = RECONNECT_BACKOFF_MS[Math.min(attempt, RECONNECT_BACKOFF_MS.length - 1)]
+    console.log(`Reconnecting in ${delay}ms (attempt ${attempt + 1})...`)
+    await sleep(delay)
+    try {
+      buildConnection()
+      rebindTokenProvider(provider)               // refresh cached token contracts
+      latestBlock = await provider.getBlockNumber()
+      subscribeAll()
+      console.log(`Reconnected. Monitoring ${watchedPairs.length} pair(s).\n`)
+      reconnecting = false
+      return
+    } catch (err) {
+      console.error(`Reconnect attempt ${attempt + 1} failed: ${err.message || err}`)
+      try { await provider.destroy() } catch (e) { /* noop */ }
+    }
+  }
+}
+
+const main = async () => {
+  metrics.markStart() // uptime counts from here, not module-load time
+
+  // -- STARTUP: announce mode & network, and validate execution prerequisites --
+  const network = config.PROJECT_SETTINGS.isLocal ? 'local Hardhat fork' : 'Arbitrum One'
+  if (IS_EXECUTION_MODE) assertExecutionReady()
+
+  buildConnection() // provider + contracts + signer + block sub + reconnect handler
+
+  if (IS_EXECUTION_MODE) {
+    console.log(`Mode: EXECUTION — profitable opportunities WILL be traded.`)
+    console.log(`  Contract: ${config.PROJECT_SETTINGS.ARBITRAGE_ADDRESS}`)
+    console.log(`  Signer:   ${account.address}`)
+  } else {
+    console.log(`Mode: MONITOR — opportunities are detected & logged only; no trades are sent.`)
+    console.log(`  (set isDeployed=true in config.json to enable execution)`)
+  }
+  console.log(`Network: ${network}\n`)
+
+  latestBlock = await provider.getBlockNumber()
+
+  console.log(`Discovering pairs available on BOTH Uniswap V3 & Pancakeswap V3...\n`)
+
+  discoveredPairs = await discoverPairs(uniswap, pancakeswap, config, provider)
+
+  if (discoveredPairs.length === 0) {
+    console.log(`No overlapping pairs found. Check your token list / network in config.json.\n`)
+    return
   }
 
-  console.log(`Monitoring ${discovered.length} pair(s). Waiting for swap event...\n`)
+  console.log(`Found ${discoveredPairs.length} arbitrage-eligible pair(s):`)
+  for (const p of discoveredPairs) {
+    console.log(`  - ${p.label}`)
+  }
+  console.log("")
+
+  subscribeAll()
+
+  console.log(`Monitoring ${watchedPairs.length} pair(s). Waiting for swap event...\n`)
 }
 
 /**

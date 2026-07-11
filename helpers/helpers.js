@@ -45,6 +45,20 @@ async function getTokenData(_address, _provider) {
   return token
 }
 
+/**
+ * Rebind every cached token's `.contract` to a new provider. Token metadata
+ * (symbol/decimals) is provider-independent and worth keeping across a
+ * reconnect, but the ethers Contract objects are bound to the old (dead)
+ * provider, so their balanceOf() calls would fail. Called on websocket
+ * reconnect to refresh them in place — because token objects are shared by
+ * reference, every pair that holds them sees the update.
+ */
+function rebindTokenProvider(_provider) {
+  for (const token of _tokenCache.values()) {
+    token.contract = new ethers.Contract(token.address, IERC20.abi, _provider)
+  }
+}
+
 async function getTokenAndContract(_token0Address, _token1Address, _provider) {
   const token0 = await getTokenData(_token0Address, _provider)
   const token1 = await getTokenData(_token1Address, _provider)
@@ -259,6 +273,7 @@ async function calculateDifference(_uPrice, _sPrice) {
 module.exports = {
   getTokenData,
   getTokenAndContract,
+  rebindTokenProvider,
   getPoolAddress,
   getPoolContract,
   getPoolContractByAddress,

@@ -3,7 +3,12 @@ const config = require('../config.json')
 
 // -- IMPORT HELPER FUNCTIONS & CONFIG -- //
 const { getTokenAndContract, getPoolContract, calculatePrice } = require('../helpers/helpers')
-const { provider, uniswap, pancakeswap } = require('../helpers/initialization.js')
+const { createProvider, createExchanges } = require('../helpers/initialization.js')
+
+// Build a dedicated connection for this one-off script (initialization no longer
+// creates eager instances — see helpers/initialization.js).
+const provider = createProvider()
+const { uniswap, pancakeswap } = createExchanges(provider)
 
 // -- CONFIGURE VALUES HERE (see config.json -> MANIPULATE) -- //
 const EXCHANGE_TO_USE = config.MANIPULATE.EXCHANGE === 'uniswap' ? uniswap : pancakeswap
