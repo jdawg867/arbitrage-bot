@@ -188,6 +188,12 @@ async function discoverPairs(_uniswap, _pancakeswap, _config, _provider) {
     byPair.get(r.pairKey).pools.push({ dexId: r.dexId, dexName: r.dexName, fee: r.fee, address: r.address })
   }
 
+  // Fraction of a pair's DEEPEST pool (by token0 reserve) below which a pool is
+  // considered too thin to trade. Thin high-fee-tier pools sit at extreme ticks
+  // and produce artifact spreads (e.g. WBTC/WETH "14%") and tiny non-executable
+  // routes; dropping them removes that noise and cuts per-swap pricing RPC.
+  const minLiqFraction = _config.STRATEGY?.MIN_LIQUIDITY_FRACTION ?? 0.02
+
   // Keep only pairs with >= 2 pools (need a distinct buy and sell venue).
   const uniq = []
   for (const { tp, pools } of byPair.values()) {
@@ -197,7 +203,31 @@ async function discoverPairs(_uniswap, _pancakeswap, _config, _provider) {
         withRetry(() => getTokenData(tp.baseAddr, _provider), 'token meta', { retryEmptyData: true }),
         withRetry(() => getTokenData(tp.quoteAddr, _provider), 'token meta', { retryEmptyData: true })
       ])
-      uniq.push({ key: `${token0.address}-${token1.address}`, token0, token1, pools })
+
+      // Measure each pool's token0 reserve (once, at discovery) and prune pools
+      // holding less than minLiqFraction of the deepest pool's reserve. Reserves
+      // are token0-denominated, so the comparison is unit-consistent within a pair.
+      const measured = await Promise.all(pools.map(async (pool) => {
+        try {
+          const reserve = await withRetry(
+            () => token0.contract.balanceOf(pool.address), 'pool liq', { retryEmptyData: true }
+          )
+          return { ...pool, reserve }
+        } catch (e) {
+          return { ...pool, reserve: 0n }
+        }
+      }))
+      const maxReserve = measured.reduce((m, p) => (p.reserve > m ? p.reserve : m), 0n)
+      const minReserve = (maxReserve * BigInt(Math.round(minLiqFraction * 10000))) / 10000n
+      const liquid = measured.filter((p) => p.reserve > 0n && p.reserve >= minReserve)
+
+      if (liquid.length < 2) continue // not enough liquid venues left
+      uniq.push({
+        key: `${token0.address}-${token1.address}`,
+        token0,
+        token1,
+        pools: liquid.map(({ dexId, dexName, fee, address }) => ({ dexId, dexName, fee, address }))
+      })
     } catch (error) {
       // Token metadata unreadable (transient RPC / non-standard token) — skip pair
     }
