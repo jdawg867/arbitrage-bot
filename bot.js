@@ -511,7 +511,18 @@ const eventHandler = async (_pair) => {
 
       printProfitabilityTable(_pair, m, token0)
 
-      if (netProfit !== null && netProfit <= 0n) {
+      // SAFETY: if gas can't be priced in token0 (no WETH/token0 pool to convert
+      // it), net profit is unknowable — REJECT rather than fall back to the
+      // gross bps gate. We never execute a trade whose net profit we can't
+      // confirm is positive. Production safety > executing an uncertain trade.
+      if (netProfit === null) {
+        metrics.incr('tradesRejected')
+        const reason = `Cannot price gas in ${token0.symbol} (no WETH/${token0.symbol} pool) — net profit unknown; refusing to trade`
+        logger.recordOutcome(buildRecord('rejected', _pair, priceInfo, m, { reason }))
+        logRejection(_pair, { metrics: m, reason })
+        return
+      }
+      if (netProfit <= 0n) {
         metrics.incr('tradesRejected')
         logger.recordOutcome(buildRecord('rejected', _pair, priceInfo, m, { reason: 'Gross profit does not cover gas' }))
         logRejection(_pair, { metrics: m, reason: 'Gross profit does not cover gas' })
