@@ -42,7 +42,7 @@
             "GMX": "0xfc5a1a6eb076a2c7ad06ed22c90d7e710e35ad0a",
             "PENDLE": "0x0c880f6761f1af8d9aa9c466984b80dab9a8c9e8"
         },
-        "FEE_TIERS": [100, 500],
+        "FEE_TIERS": [100, 500, 2500, 3000],
         "STABLES": [
             "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
             "0xff970a61a04b1ca14834a43f5de4533ebddb5cc8",
