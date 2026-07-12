@@ -76,6 +76,10 @@ const MIN_PROFIT_BPS = config.STRATEGY.MIN_PROFIT_BPS       // min net profit as
 // trade must clear this dollar amount to execute — filters out gas-dominated
 // marginal trades regardless of ROI%. 0 = disabled. (execution mode only)
 const MIN_NET_PROFIT_USD = config.STRATEGY.MIN_NET_PROFIT_USD ?? 0
+// Minimum ACTIVE (tradable) liquidity in USD for a pool to be monitored. Measured
+// from the pool's active-tick virtual reserves (L + sqrtPrice), NOT raw contract
+// balances. 0 = disabled. Applied once at discovery. (execution & monitor modes)
+const MIN_POOL_LIQUIDITY_USD = config.STRATEGY.MIN_POOL_LIQUIDITY_USD ?? 0
 const MAX_POOL_FRACTION = config.STRATEGY.MAX_POOL_FRACTION // never route more than this fraction of the buy pool
 const SEARCH_STEPS = config.STRATEGY.SEARCH_STEPS           // resolution of the coarse size grid
 const REFINE_ITERS = config.STRATEGY.REFINE_ITERS           // ternary-refinement iterations around the best grid point
@@ -378,6 +382,17 @@ const main = async () => {
   if (discoveredPairs.length === 0) {
     console.log(`No overlapping pairs found. Check your token list / network in config.json.\n`)
     return
+  }
+
+  // Drop pools below MIN_POOL_LIQUIDITY_USD of ACTIVE (tradable) liquidity — the
+  // real depth at the current tick, not raw contract balances. Keeps only pools
+  // deep enough to size into, and cuts per-swap RPC by monitoring fewer pools.
+  if (MIN_POOL_LIQUIDITY_USD > 0) {
+    discoveredPairs = await filterByActiveLiquidity(discoveredPairs)
+    if (discoveredPairs.length === 0) {
+      console.log(`No pairs left after the $${MIN_POOL_LIQUIDITY_USD} liquidity filter.\n`)
+      return
+    }
   }
 
   console.log(`Found ${discoveredPairs.length} arbitrage-eligible pair(s):`)
@@ -839,6 +854,64 @@ const toUsd = (raw, token0, baseUsd) => {
   if (raw === null || raw === undefined || !baseUsd) return 'n/a'
   const v = Number(fmt(raw, token0)) * baseUsd
   return `${v < 0 ? '-$' : '$'}${Math.abs(v).toFixed(4)}`
+}
+
+// Active (tradable) liquidity of a pool valued in USD — from the pool's
+// active-tick virtual reserves (L + sqrtPrice), NOT raw contract balances. Both
+// sides hold ~equal value at the current price, so total ≈ 2 × one side. token0
+// is the base; when it's WETH we value via the cached WETH price (no extra
+// quote), else via a spot token0->USDC quote. Returns a USD number (0 if it
+// can't be read/priced).
+const poolActiveUsd = async (poolContract, token0, token1, baseUsd) => {
+  let L, s0
+  try {
+    ;[L, s0] = await Promise.all([
+      withRetry(() => poolContract.liquidity(), 'liquidity', { retryEmptyData: true }),
+      withRetry(() => poolContract.slot0(), 'slot0', { retryEmptyData: true })
+    ])
+  } catch (e) {
+    return 0
+  }
+  const Ln = Number(L)
+  const sqrtP = Number(s0[0]) / (2 ** 96) // sqrtPriceX96 -> sqrt(poolToken1/poolToken0)
+  if (!(sqrtP > 0) || !(Ln > 0)) return 0
+  // Pool orders tokens by address (poolToken0 = lower). Virtual reserves (raw):
+  //   poolToken0 = L / sqrtP,  poolToken1 = L * sqrtP
+  const pairT0IsPoolT0 = token0.address.toLowerCase() < token1.address.toLowerCase()
+  const t0VirtRaw = pairT0IsPoolT0 ? (Ln / sqrtP) : (Ln * sqrtP)
+  const t0Virt = t0VirtRaw / (10 ** token0.decimals)
+  let usdPerT0 = 0
+  if (token0.address.toLowerCase() === WETH_ADDRESS.toLowerCase() && baseUsd > 0) {
+    usdPerT0 = baseUsd
+  } else {
+    const oneRaw = await valueInUsdc(ethers.parseUnits('1', token0.decimals), token0)
+    usdPerT0 = oneRaw === null ? 0 : Number(ethers.formatUnits(oneRaw, USDC_DECIMALS))
+  }
+  return t0Virt * usdPerT0 * 2
+}
+
+// Drop pools whose active liquidity is below MIN_POOL_LIQUIDITY_USD; keep pairs
+// that still have >= 2 pools. One-time at discovery (reads L + slot0 per pool).
+const filterByActiveLiquidity = async (pairs) => {
+  const wethPair = pairs.find((p) => p.token0.address.toLowerCase() === WETH_ADDRESS.toLowerCase())
+  const baseUsd = wethPair ? await baseUsdPrice(wethPair.token0) : 0
+
+  console.log(`Filtering pools by active (tradable) liquidity >= $${MIN_POOL_LIQUIDITY_USD.toLocaleString()}...`)
+  const kept = []
+  let droppedPools = 0
+  for (const p of pairs) {
+    const liquid = []
+    for (const pool of p.pools) {
+      const contract = getPoolContractByAddress(exchangeFor(pool.dexId), pool.address, provider)
+      const usd = await poolActiveUsd(contract, p.token0, p.token1, baseUsd)
+      dbg(`  ${p.label} ${pool.dexId}:${pool.fee} active≈$${Math.round(usd).toLocaleString()}`)
+      if (usd >= MIN_POOL_LIQUIDITY_USD) liquid.push(pool)
+      else droppedPools++
+    }
+    if (liquid.length >= 2) kept.push({ ...p, pools: liquid })
+  }
+  console.log(`  kept ${kept.length} pair(s); dropped ${droppedPools} thin pool(s).\n`)
+  return kept
 }
 
 const printProfitabilityTable = async (_pair, m, token0) => {
