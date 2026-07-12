@@ -23,11 +23,17 @@ const ISwapRouter = require('@uniswap/v3-periphery/artifacts/contracts/interface
 // (block events) arrive over the socket and don't count against it.
 const rpcLimiter = createRateLimiter(config.PROJECT_SETTINGS.MAX_RPC_PER_SEC || 0)
 
-// WebSocket RPC endpoint (local Hardhat fork or live Arbitrum via Alchemy).
+// WebSocket RPC endpoint. Priority:
+//   1. local Hardhat fork (isLocal)
+//   2. RPC_WSS_URL env — a full wss:// URL for ANY provider (fresh Alchemy app,
+//      PublicNode, dRPC, Ankr, …). Use this to switch providers without code
+//      changes, e.g. when an Alchemy monthly CU quota is exhausted.
+//   3. Alchemy from ALCHEMY_API_KEY (default)
+// A WebSocket endpoint is required — the bot subscribes to Swap/block events.
 function providerUrl() {
-  return config.PROJECT_SETTINGS.isLocal
-    ? `ws://127.0.0.1:8545/`
-    : `wss://arb-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}`
+  if (config.PROJECT_SETTINGS.isLocal) return `ws://127.0.0.1:8545/`
+  if (process.env.RPC_WSS_URL) return process.env.RPC_WSS_URL
+  return `wss://arb-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}`
 }
 
 /**
