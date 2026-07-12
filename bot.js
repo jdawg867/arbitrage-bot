@@ -940,6 +940,11 @@ const evaluateCombo = async (_pair, _combo) => {
     )
     if (buyReserve === 0n) return null
     const maxFlash = (buyReserve * BigInt(Math.round(MAX_POOL_FRACTION * 10000))) / 10000n
+    dbg(`sizing ${buy.dexId}:${buy.fee}->${sell.dexId}:${sell.fee}`,
+      `buyPool ${token0.symbol} reserve=${fmt(buyReserve, token0)}`,
+      `MAX_POOL_FRACTION=${MAX_POOL_FRACTION}`,
+      `maxFlash=${fmt(maxFlash, token0)} ${token0.symbol}`,
+      `(sell-pool slippage, via quotes, usually binds well below this)`)
 
     // Round-trip: token0 --(buy pool, buy.fee)--> token1 --(sell pool, sell.fee)--> token0.
     // Two OPPOSITE-direction quotes (token0->token1 then token1->token0), never two
@@ -970,6 +975,8 @@ const evaluateCombo = async (_pair, _combo) => {
 
     const opt = await maximizeProfit(roundTrip, maxFlash)
     if (!opt || opt.profit <= 0n) return null
+    dbg(`  chosen size=${fmt(opt.amount, token0)} ${token0.symbol} of maxFlash ${fmt(maxFlash, token0)}`,
+      `— ${opt.capped ? 'CAP-bound (raise MAX_POOL_FRACTION)' : 'slippage-bound (profit peaks below cap; deeper pools needed for size)'}`)
 
     return {
       combo: _combo,
