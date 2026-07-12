@@ -136,6 +136,10 @@ defaults with a placeholder `ARBITRAGE_ADDRESS`.
 - `GAS_LIMIT` / `GAS_PRICE` — legacy fields, no longer used (the strategy now estimates
   real gas via `estimateGas`).
 - `DISCOVERY_CONCURRENCY` — how many factory probes run at once during discovery.
+- `MAX_RPC_PER_SEC` — client-side cap on outbound RPC requests per second (token
+  bucket; allows short bursts, then sustains this rate). Keeps you under the RPC
+  provider's per-second compute-unit ceiling so the bot never trips a 429. `0`
+  disables it. For a free Alchemy tier, ~`8`–`10` is a safe starting point.
 - `DEXES` — which DEXes to trade across, by id: `uni`, `pancake`, `sushi` (default all
   configured). The search forms every buy/sell route across the enabled DEXes **and**
   their fee tiers. Examples: `["uni"]` = Uniswap-only cross-fee-tier arbitrage (both legs

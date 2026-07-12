@@ -8,6 +8,7 @@
         "GAS_LIMIT": 600000,
         "GAS_PRICE": 0.00000001,
         "DISCOVERY_CONCURRENCY": 3,
+        "MAX_RPC_PER_SEC": 10,
         "SKIP_STABLE_PAIRS": false,
         "EVAL_ONCE_PER_BLOCK": true,
         "DEXES": ["uni", "pancake"]

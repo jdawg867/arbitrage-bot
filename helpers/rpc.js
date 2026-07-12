@@ -76,4 +76,35 @@ async function withRetry(fn, label = 'rpc', opts = {}) {
   }
 }
 
-module.exports = { withRetry, isTransient, isEmptyData }
+/**
+ * Client-side RPC rate limiter (token bucket). Keeps the bot's own request rate
+ * under the provider's per-second compute-unit ceiling so it never trips a 429,
+ * while still allowing short bursts (e.g. the parallel size-search quotes) up to
+ * `capacity`, then sustaining `ratePerSec`. `ratePerSec <= 0` disables it.
+ *
+ * Returns { acquire } — await acquire() before each request. Requests beyond the
+ * rate are delayed (queued), not dropped.
+ */
+function createRateLimiter(ratePerSec, capacity) {
+  if (!ratePerSec || ratePerSec <= 0) {
+    return { acquire: async () => {}, enabled: false }
+  }
+  const cap = capacity && capacity > 0 ? capacity : ratePerSec // ~1s burst headroom
+  let tokens = cap
+  let last = Date.now()
+  return {
+    enabled: true,
+    async acquire() {
+      for (;;) {
+        const now = Date.now()
+        tokens = Math.min(cap, tokens + ((now - last) / 1000) * ratePerSec)
+        last = now
+        if (tokens >= 1) { tokens -= 1; return }
+        // wait just long enough for the next token to accrue
+        await sleep(Math.max(5, Math.ceil(((1 - tokens) / ratePerSec) * 1000)))
+      }
+    }
+  }
+}
+
+module.exports = { withRetry, isTransient, isEmptyData, createRateLimiter }
