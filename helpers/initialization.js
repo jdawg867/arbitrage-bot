@@ -12,9 +12,16 @@ const ethers = require('ethers')
 
 const config = require('../config.json')
 const metrics = require('./metrics')
+const { createRateLimiter } = require('./rpc')
 const IUniswapV3Factory = require('@uniswap/v3-core/artifacts/contracts/interfaces/IUniswapV3Factory.sol/IUniswapV3Factory.json')
 const IQuoter = require('@uniswap/v3-periphery/artifacts/contracts/interfaces/IQuoterV2.sol/IQuoterV2.json')
 const ISwapRouter = require('@uniswap/v3-periphery/artifacts/contracts/interfaces/ISwapRouter.sol/ISwapRouter.json')
+
+// Global client-side RPC rate limiter, shared across the (rebuilt-on-reconnect)
+// provider. MAX_RPC_PER_SEC caps our outbound request rate below the provider's
+// per-second ceiling so we never trip a 429; 0 disables it. Subscription pushes
+// (block events) arrive over the socket and don't count against it.
+const rpcLimiter = createRateLimiter(config.PROJECT_SETTINGS.MAX_RPC_PER_SEC || 0)
 
 // WebSocket RPC endpoint (local Hardhat fork or live Arbitrum via Alchemy).
 function providerUrl() {
@@ -31,7 +38,8 @@ function providerUrl() {
  */
 function instrumentProvider(p) {
   const originalSend = p.send.bind(p)
-  p.send = (method, params) => {
+  p.send = async (method, params) => {
+    await rpcLimiter.acquire() // block until under MAX_RPC_PER_SEC (no-op if disabled)
     metrics.incr('rpcRequests')
     return originalSend(method, params)
   }
