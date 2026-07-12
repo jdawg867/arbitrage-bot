@@ -16,6 +16,7 @@
     "STRATEGY": {
         "MIN_PROFIT_BPS": 10,
         "MIN_NET_PROFIT_USD": 1.0,
+        "MIN_POOL_LIQUIDITY_USD": 25000,
         "MAX_POOL_FRACTION": 0.05,
         "SEARCH_STEPS": 20,
         "REFINE_ITERS": 12,
