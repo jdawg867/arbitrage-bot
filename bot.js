@@ -103,10 +103,11 @@ const MAX_SPREAD_PCT = config.STRATEGY.MAX_SPREAD_PCT ?? 50
 const DEBUG = process.env.DEBUG === '1' || config.PROJECT_SETTINGS.DEBUG === true
 const dbg = (...args) => { if (DEBUG) console.log('[debug]', ...args) }
 
-// WETH base lets us compare profit and gas directly (both ETH-denominated)
-const WETH_ADDRESS = ethers.getAddress(config.TOKENS.BASE.WETH)
-// USDC is used as the ~USD unit for logging profit/gas values for tax reporting
-const USDC_ADDRESS = ethers.getAddress(config.TOKENS.BASE.USDC)
+// WETH (for gas pricing) and USDC (the USD unit) addresses. Read from BASE, but
+// fall back to QUOTE so the bot still works when BASE is narrowed (e.g. WETH-only
+// base) and no longer lists USDC/WETH under BASE.
+const WETH_ADDRESS = ethers.getAddress(config.TOKENS.BASE.WETH || config.TOKENS.QUOTE.WETH)
+const USDC_ADDRESS = ethers.getAddress(config.TOKENS.BASE.USDC || config.TOKENS.QUOTE.USDC)
 const USDC_DECIMALS = 6
 
 // Format a raw token amount for display
@@ -513,7 +514,7 @@ const eventHandler = async (_pair) => {
       m.gasCostBase = gasCostBase
       m.netProfit = netProfit
 
-      printProfitabilityTable(_pair, m, token0)
+      await printProfitabilityTable(_pair, m, token0)
 
       // SAFETY: if gas can't be priced in token0 (no WETH/token0 pool to convert
       // it), net profit is unknowable — REJECT rather than fall back to the
@@ -558,7 +559,7 @@ const eventHandler = async (_pair) => {
         }
       }
     } else {
-      printProfitabilityTable(_pair, m, token0)
+      await printProfitabilityTable(_pair, m, token0)
     }
 
     m.grossProfitUsd = await valueInUsdc(m.grossProfit, token0)
@@ -585,7 +586,7 @@ const eventHandler = async (_pair) => {
       const exec = await executeTrade(combo, _pair, m.flashAmount)
       metrics.incr('tradesExecuted')
       // Log estimated (pre-send) vs realized net + attribute any discrepancy.
-      logExecutionOutcome(_pair, token0, m, exec)
+      await logExecutionOutcome(_pair, token0, m, exec)
       logger.recordOutcome(await buildExecutedRecord(_pair, priceInfo, m, exec))
       console.log(`Trade logged${exec.txHash ? ` (tx ${exec.txHash})` : ''}\n`)
     } finally {
@@ -820,20 +821,45 @@ const estimateTradeGas = async (_combo, _pair, _flashAmount) => {
 // Pretty-print the chosen opportunity. Gas / net-profit rows only appear in
 // execution mode (monitor mode never estimates gas), so they're printed
 // conditionally on whether gas metrics were populated.
-const printProfitabilityTable = (_pair, m, token0) => {
+// Cached USD price of the base token (token0), refreshed once per block, so all
+// amounts can be shown in USD with ~one quote per block instead of one per value.
+// (USDC is the USD unit; USDC/USDT/USD are ~1:1 on Arbitrum.)
+let _baseUsd = { addr: null, block: -1, price: 0 }
+const baseUsdPrice = async (token0) => {
+  if (_baseUsd.addr === token0.address && _baseUsd.block === latestBlock && _baseUsd.price > 0) {
+    return _baseUsd.price
+  }
+  const usdcRaw = await valueInUsdc(ethers.parseUnits('1', token0.decimals), token0)
+  const price = usdcRaw === null ? 0 : Number(ethers.formatUnits(usdcRaw, USDC_DECIMALS))
+  if (price > 0) _baseUsd = { addr: token0.address, block: latestBlock, price }
+  return price
+}
+// Render a raw token0 amount as USD (e.g. "$3.6012"); null-safe.
+const toUsd = (raw, token0, baseUsd) => {
+  if (raw === null || raw === undefined || !baseUsd) return 'n/a'
+  const v = Number(fmt(raw, token0)) * baseUsd
+  return `${v < 0 ? '-$' : '$'}${Math.abs(v).toFixed(4)}`
+}
+
+const printProfitabilityTable = async (_pair, m, token0) => {
+  const baseUsd = await baseUsdPrice(token0)
+  // Show USD (the objective) with the token amount in parentheses for reference.
+  const line = (raw) => (raw === null || raw === undefined)
+    ? 'n/a'
+    : `${toUsd(raw, token0, baseUsd)}  (${fmt(raw, token0)} ${token0.symbol})`
   const data = {
     'Pair': _pair.label,
     'Route': `${m.buyOn} -> ${m.sellOn}`,
-    'Flash amount': `${fmt(m.flashAmount, token0)} ${token0.symbol}`,
-    'Gross profit': `${fmt(m.grossProfit, token0)} ${token0.symbol}`,
+    'Flash amount': line(m.flashAmount),
+    'Gross profit': line(m.grossProfit),
     'ROI': `${m.roiPct.toFixed(4)}%`
   }
   if (m.gasCostWei !== undefined) {
     data['Est. gas'] = m.gasCostBase === null
       ? `${ethers.formatUnits(m.gasCostWei, 18)} ETH (no WETH/${token0.symbol} pool to price it)`
-      : `${fmt(m.gasCostBase, token0)} ${token0.symbol}`
+      : line(m.gasCostBase)
     if (m.netProfit !== null && m.netProfit !== undefined) {
-      data['Net profit (after gas)'] = `${fmt(m.netProfit, token0)} ${token0.symbol}`
+      data['Net profit (after gas)'] = line(m.netProfit)
     }
   } else {
     data['Est. gas'] = 'n/a (monitor mode — set isDeployed=true to price gas & trade)'
@@ -1003,8 +1029,9 @@ const buildOptimizerDiagnostics = (_eval, token0, gasBase) => {
  * lets estimated-net-positive trades through, so a NEGATIVE realized net can
  * only come from drift between estimate and block inclusion — surfaced loudly.
  */
-const logExecutionOutcome = (_pair, token0, m, exec) => {
-  const s = (v) => ((v === null || v === undefined) ? 'n/a' : `${fmt(v, token0)} ${token0.symbol}`)
+const logExecutionOutcome = async (_pair, token0, m, exec) => {
+  const baseUsd = await baseUsdPrice(token0)
+  const s = (v) => ((v === null || v === undefined) ? 'n/a' : `${toUsd(v, token0, baseUsd)}  (${fmt(v, token0)} ${token0.symbol})`)
   const realizedNet = exec.gasBase === null ? null : exec.realizedGross - exec.gasBase
   const grossDrift = (m.grossProfit === undefined || m.grossProfit === null) ? null : exec.realizedGross - m.grossProfit
   const gasDrift = (exec.gasBase === null || m.gasCostBase === undefined || m.gasCostBase === null) ? null : exec.gasBase - m.gasCostBase
